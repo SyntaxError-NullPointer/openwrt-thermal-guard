@@ -4,6 +4,18 @@ All notable changes to `thermal-guard` and `luci-app-thermal-guard`.
 Versions follow `Major.Minor.Build.Revision`; both packages are released
 together and carry the same number.
 
+## 1.5.0
+
+### Added
+
+- **Wi-Fi temperatures with the proprietary MediaTek driver.** `mt_wifi`, used
+  by the MTK vendor images of the Banana Pi R3 Mini, registers no hwmon sensor,
+  so the status page showed no Wi-Fi readings although the LuCI overview did.
+  The extra sensors now also read `CurrentTemperature` from
+  `iwpriv <interface> stat` for `ra0`, `rax0` and the other `mt_wifi`
+  interfaces, only while they are up and bounded by `timeout`, the same way
+  ImmortalWrt's `autocore` does it. Shown as Wi-Fi 1, Wi-Fi 2, for display only.
+
 ## 1.4.0
 
 Where the kernel drives the fan, thermal-guard can now lower its trip points

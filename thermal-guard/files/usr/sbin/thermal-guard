@@ -20,7 +20,7 @@
 
 set -u
 
-THERMAL_GUARD_VERSION="1.4.0"
+THERMAL_GUARD_VERSION="1.5.0"
 TAG=thermal-guard
 STATE_DIR="${STATE_DIR:-/var/run/thermal-guard}"
 STATE="$STATE_DIR/state"
@@ -43,6 +43,7 @@ HOLD_MINUTES=3; HYSTERESIS=10
 # Tests point this at a planted tree. Environment only, UCI cannot move it.
 THERMAL_ROOT="${THERMAL_ROOT:-/sys/class/thermal}"
 DT_ROOT="${DT_ROOT:-/sys/firmware/devicetree/base}"
+NET_ROOT="${NET_ROOT:-/sys/class/net}"
 CPU_TEMP_PATH="$THERMAL_ROOT/thermal_zone0/temp"
 # Hands off the fan unless told otherwise: most boards that have one also have
 # a regulator for it, and this is not meant to compete.
@@ -1122,6 +1123,22 @@ output = /etc/rc.local' reject
 	printf '\000\000\000\214\000\000\000\144\000\000\000\062\000\000\000\000' > "$DT_ROOT/pwm-fan/cooling-levels"
 	chk "cooling-levels are read from the device tree" "$(tg_fan_levels)" "140 100 50 0"
 	DT_ROOT=$saved_dt
+
+	# mt_wifi temperatures through iwpriv, against a planted net tree and a
+	# stand-in iwpriv, so the real radios are never asked
+	saved_net=$NET_ROOT; saved_path=$PATH; NET_ROOT="$dir/net"
+	mkdir -p "$NET_ROOT/ra0" "$NET_ROOT/rax0" "$dir/bin"
+	# shellcheck disable=SC2016  # $1 belongs to the stand-in script, not to us
+	printf '#!/bin/sh\ncase "$1" in\n\tra0) echo "CurrentTemperature              = 53" ;;\n\trax0) echo "CurrentTemperature              = 48;reboot" ;;\nesac\n' > "$dir/bin/iwpriv"
+	chmod 0755 "$dir/bin/iwpriv"
+	PATH="$dir/bin:$PATH"
+	echo 0x1303 > "$NET_ROOT/ra0/flags"; echo 0x1002 > "$NET_ROOT/rax0/flags"
+	chk "mt_wifi: an active radio is read" "$(tg_read_mtwifi)" "mtwifi_phy0=53"
+	echo 0x1303 > "$NET_ROOT/rax0/flags"
+	chk "mt_wifi: a garbled answer is dropped" "$(tg_read_mtwifi)" "mtwifi_phy0=53"
+	echo 0x1002 > "$NET_ROOT/ra0/flags"
+	chk "mt_wifi: a radio that is down is not asked" "$(tg_read_mtwifi)" ""
+	NET_ROOT=$saved_net; PATH=$saved_path
 
 	# Without timeout a hung modem stops the loop, so its absence is a failure
 	command -v timeout >/dev/null 2>&1 && r=present || r=missing

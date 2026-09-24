@@ -664,6 +664,41 @@ tg_read_extra_sensors() {
 		printf '%s=%s
 ' "$name" "$raw"
 	done
+
+	tg_read_mtwifi
+}
+
+# The proprietary MediaTek driver (mt_wifi) registers no hwmon sensor, its
+# temperature is only reachable through a private ioctl. Same query as
+# ImmortalWrt's autocore, and like it only for interfaces that are up.
+# Numbered by position in the list, so a radio that is down leaves a gap
+# instead of renaming the other one.
+tg_read_mtwifi() {
+	local ifname flags raw n=-1
+	command -v iwpriv >/dev/null 2>&1 || return 0
+	for ifname in ra0 rax0 rai0 ray0 rae0 raz0; do
+		n=$((n + 1))
+		[ -r "$NET_ROOT/$ifname/flags" ] || continue
+		flags=$(cat "$NET_ROOT/$ifname/flags" 2>/dev/null)
+		case "$flags" in 0x[0-9a-fA-F]*) ;; *) continue ;; esac
+		[ $((flags & 1)) -eq 1 ] || continue
+		raw=$(tg_mtwifi_temp "$ifname")
+		[ -n "$raw" ] || continue
+		printf 'mtwifi_phy%s=%s\n' "$n" "$raw"
+	done
+}
+
+tg_mtwifi_temp() { # $1 interface
+	local out v
+	if command -v timeout >/dev/null 2>&1; then
+		out=$(timeout 3 iwpriv "$1" stat 2>/dev/null)
+	else
+		out=$(iwpriv "$1" stat 2>/dev/null)
+	fi
+	v=$(printf '%s\n' "$out" | sed -n 's/^CurrentTemperature *= *\(-\{0,1\}[0-9]\{1,3\}\) *$/\1/p' | head -n 1)
+	v=$(tg_int "$v")
+	[ -n "$v" ] && [ "$v" -gt -100 ] && [ "$v" -lt 200 ] && echo "$v"
+	return 0
 }
 
 # ---- stage actions ---------------------------------------------------------

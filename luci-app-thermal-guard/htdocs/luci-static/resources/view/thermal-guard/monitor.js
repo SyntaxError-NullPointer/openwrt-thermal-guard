@@ -48,7 +48,7 @@ function gauge(value, warn, crit, max) {
 // Sensor names come straight from the kernel. Translate the ones people actually
 // recognise, leave the rest as reported rather than guessing.
 function sensorLabel(name) {
-	var m = name.match(/^mt79\d\d_phy(\d)/);
+	var m = name.match(/^(?:mt79\d\d|mtwifi)_phy(\d)/);
 	if (m)
 		return _('Wi-Fi %d').format(parseInt(m[1], 10) + 1);
 	if (name.indexOf('mdio_bus') === 0 || name.indexOf('phy') === 0)

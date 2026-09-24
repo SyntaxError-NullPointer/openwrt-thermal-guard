@@ -78,9 +78,10 @@ stage is given to prove it worked before the next one starts.
 
 ## Screenshots
 
-The status page on two boards: a Banana Pi R3 Mini with a Fibocom modem and an
-NVMe drive, where another program drives the fan, and a GL-iNet GL-X3000 with a
-Quectel modem, where the kernel does.
+The status page on two boards: a Banana Pi R3 Mini with a Fibocom modem, an NVMe
+drive and the MediaTek vendor Wi-Fi driver, where another program drives the fan,
+and a GL-iNet GL-X3000 with a Quectel modem, where the kernel does. Wi-Fi 1 and 2
+come from `iwpriv` on the one and from hwmon on the other.
 
 <table>
   <tr>
@@ -332,6 +333,12 @@ else reads that file, so nothing but the daemon talks to the modem.
 
 * **Status -> Thermal Guard** is the monitor page: temperatures, fan state, stage.
 * **Status -> Overview** gets a short temperature block, installed with the LuCI app.
+* **Other sensors** of the board (`extra_sensors`, on by default): every hwmon and
+  thermal zone temperature besides the processor, such as Wi-Fi chips, ethernet
+  phys and NVMe drives. The proprietary MediaTek Wi-Fi driver `mt_wifi` exposes
+  none of those; its radios are read with `iwpriv <interface> stat` instead, the
+  way ImmortalWrt's own overview does it, and only while the interface is up.
+  These readings are shown only, they never trigger a stage.
 * **RRD graphs** through collectd. The package ships an exec plugin feed, enable it
   in `/etc/collectd.conf`:
 
