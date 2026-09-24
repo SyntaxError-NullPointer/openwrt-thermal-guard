@@ -1,0 +1,1315 @@
+#!/bin/sh
+# shellcheck shell=busybox
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# thermal-guard: last line of defence when a router cooks itself, typically after
+# a fan failure. Watches SoC and modem temperature and escalates in stages:
+#
+#   stage 0  warning, fan to full speed unless fan_mode is none
+#   stage 1  modem radio off
+#   stage 2  Wi-Fi off
+#
+# Stages never roll back on their own. Cooling down is reported, but the operator
+# decides when the box is safe again ("thermal-guard reset"). That is deliberate:
+# a fan that failed once will fail again, and a silent recovery hides it.
+#
+# Usage: thermal-guard daemon|status|reset|test <cpu> <modem>|selftest|-V
+#
+# "test" is a dry run: it reports what the current state plus those readings
+# would decide, and runs and writes nothing. Safe on a live box.
+
+set -u
+
+THERMAL_GUARD_VERSION="1.4.0"
+TAG=thermal-guard
+STATE_DIR="${STATE_DIR:-/var/run/thermal-guard}"
+STATE="$STATE_DIR/state"
+# /var/run is tmpfs, so the working state dies with a reboot. Stages must not:
+# a box that rebooted still has the broken fan it rebooted with. Mirror them to
+# the overlay, but only on a stage change, which is a handful of writes per
+# incident rather than one per cycle.
+PERSIST_DIR="${PERSIST_DIR:-/etc/thermal-guard}"
+PERSIST="$PERSIST_DIR/state"
+OUTBOX="$STATE_DIR/outbox"
+EVLOG="$STATE_DIR/log"
+STATUS_FILE="${STATUS_FILE:-/var/run/thermal-guard.status}"
+LIB_DIR="${LIB_DIR:-/usr/share/thermal-guard}"
+
+# ---- configuration defaults, overridden from UCI ---------------------------
+ENABLED=1; INTERVAL=20
+CPU_WARN=70; CPU_CRIT=80; CPU_EMERGENCY=90
+MODEM_WARN=80; MODEM_CRIT=88
+HOLD_MINUTES=3; HYSTERESIS=10
+# Tests point this at a planted tree. Environment only, UCI cannot move it.
+THERMAL_ROOT="${THERMAL_ROOT:-/sys/class/thermal}"
+DT_ROOT="${DT_ROOT:-/sys/firmware/devicetree/base}"
+CPU_TEMP_PATH="$THERMAL_ROOT/thermal_zone0/temp"
+# Hands off the fan unless told otherwise: most boards that have one also have
+# a regulator for it, and this is not meant to compete.
+FAN_MODE=none; FAN_CDEV=""; FAN_ZONE=""; FAN_CDEV_TYPE=pwm-fan; FAN_GOVERNOR=step_wise
+# What the fan is read from, set by tg_fan_detect. FAN_MODE says what may be
+# written; with none this can still name something to show.
+FAN_VIEW=none
+# PWM_FULL is the raw value that means full speed, PWM_IDLE the one that means
+# slowest. Several boards wire the fan inverted, where full speed is 1 and 255
+# stops it, so the pair carries the polarity. No default: a guessed polarity
+# stops an inverted fan in exactly the emergency it was forced for.
+PWM_PATH=""; PWM_ENABLE_PATH=""; PWM_FULL=""; PWM_IDLE=""
+MODEM_SOURCE=auto; MODEM_AT_PORT=auto; MODEM_TEMP_FILE=""
+AT_LOCK=/var/lock/modem-at.lock
+# Seconds for the lock wait plus the query, and for the query alone. Well
+# below the interval, so a hung modem costs one reading, not the loop.
+AT_WAIT="${AT_WAIT:-10}"; AT_TIMEOUT="${AT_TIMEOUT:-5}"; AT_NO_TIMEOUT_TOLD=0
+# Trip management: off, or modem to lower the fan's trips for a hot modem.
+# TRIP_ACTIVE is the baseline in whole degrees, empty means the device tree's.
+TRIP_BOOST=off; TRIP_ACTIVE=""; TRIP_BOOST_OFFSET=15; TRIP_DT_UCI=""
+STAGE1_ACTION=modem_radio_off; STAGE2_ACTION=wifi_off
+# Only AT+CFUN=4 or =0: the page can write every option, and a free AT command
+# would let it reset or brick the modem.
+MODEM_RADIO_OFF_AT='AT+CFUN=4'
+# Interface for interface_down, the uplink interface when empty.
+ACTION_INTERFACE=""
+# Seconds between attempts when an action is read back.
+CFUN_SETTLE=2
+
+NOTIFY_URL=""; NOTIFY_HEADER=""; UPLINK_INTERFACE=""; EXTRA_SENSORS=1
+# Executables an administrator drops in over ssh. Not reachable through the
+# configuration, which is the point: the web interface can edit every UCI option
+# but cannot write here, so nothing it changes ends up running as root.
+HOOK_DIR="${HOOK_DIR:-/etc/thermal-guard/hooks}"
+# Last sensor tg_cpu_detect settled on, so the daemon reports a substitution
+# once rather than once per cycle. NO_SENSOR marks a board that reports no
+# temperature at all, which the status file passes on so the page can say so.
+CPU_SENSOR_LAST=""; NO_SENSOR=0
+# Set once the missing pwm polarity has been reported, for the same reason.
+FAN_POLARITY_TOLD=0
+# Set by tg_daemon. Only the long running process narrates the configuration;
+# status, reset and test run the same checks but stay quiet about them.
+DAEMON=0
+
+# shellcheck source=thermal-guard/files/usr/share/thermal-guard/backends.sh
+. "$LIB_DIR/backends.sh"
+# shellcheck source=thermal-guard/files/usr/share/thermal-guard/trips.sh
+. "$LIB_DIR/trips.sh"
+
+# ---- state -----------------------------------------------------------------
+tg_state_clear() {
+	STAGE=-1; T0=0; T1=0; T2=0
+	REF_CPU0=0; REF_MODEM0=0; REF_CPU1=0; REF_MODEM1=0
+	PENDING=-1; PENDING_N=0; COOLED=0
+	LAST_CPU=""; LAST_MODEM=""; LAST_MODEM_SRC=""; LAST_TS=0
+	# What the fan was doing before we took it over, so the release can put it
+	# back. Lives in the state so it survives a daemon restart. POLICY is the
+	# thermal zone governor for cooling_device mode, the other two are the pwm
+	# chip's manual mode and duty cycle.
+	FAN_SAVED_ENABLE=""; FAN_SAVED_PWM=""; FAN_SAVED_POLICY=""
+	# Counts resets. The daemon compares it to spot a reset that happened while
+	# it was busy deciding. tg_reset restores the old value after clearing.
+	GEN=0
+}
+tg_state_clear
+DECISION=none
+FROM_STAGE=0
+DRY=0
+MODEM_VAL=""
+MODEM_SRC=""
+
+# ---- decision logic, pure: touches variables only, no side effects ---------
+#
+# Candidate is the highest stage above the current one whose condition holds.
+# A stage only triggers after two consecutive hits, which filters sensor glitches.
+tg_candidate() {
+	local cpu="$1" modem="$2" now="$3" hold=$((HOLD_MINUTES * 60)) c=-1 down
+
+	if [ "$STAGE" -lt 0 ]; then
+		{ [ -n "$cpu" ] && [ "$cpu" -ge "$CPU_WARN" ]; } ||
+			{ [ -n "$modem" ] && [ "$modem" -ge "$MODEM_WARN" ]; } && c=0
+	fi
+
+	if [ "$STAGE" -lt 1 ]; then
+		if { [ -n "$cpu" ] && [ "$cpu" -ge "$CPU_CRIT" ]; } ||
+			{ [ -n "$modem" ] && [ "$modem" -ge "$MODEM_CRIT" ]; }; then
+			c=1
+		elif [ "$STAGE" -eq 0 ] && [ $((now - T0)) -ge "$hold" ]; then
+			# "no drop since stage 0": no reading is below where we started
+			down=0
+			[ -n "$cpu" ] && [ "$cpu" -lt "$REF_CPU0" ] && down=1
+			[ -n "$modem" ] && [ "$modem" -lt "$REF_MODEM0" ] && down=1
+			[ "$down" = 0 ] && c=1
+		fi
+	fi
+
+	if [ "$STAGE" -lt 2 ]; then
+		if [ -n "$cpu" ] && [ "$cpu" -ge "$CPU_EMERGENCY" ]; then
+			c=2
+		elif [ "$STAGE" -eq 1 ] && [ $((now - T1)) -ge "$hold" ]; then
+			# "still climbing": some reading is above where stage 1 started
+			{ [ -n "$cpu" ] && [ "$cpu" -gt "$REF_CPU1" ]; } ||
+				{ [ -n "$modem" ] && [ "$modem" -gt "$REF_MODEM1" ]; } && c=2
+		fi
+	fi
+
+	echo "$c"
+}
+
+tg_enter_stage() { # $1 stage, $2 cpu, $3 modem, $4 now
+	case "$1" in
+		0) T0=$4; REF_CPU0=${2:-0}; REF_MODEM0=${3:-0} ;;
+		1) T1=$4; REF_CPU1=${2:-0}; REF_MODEM1=${3:-0} ;;
+		2) T2=$4 ;;
+	esac
+	STAGE=$1
+}
+
+tg_decide() { # $1 cpu, $2 modem, $3 now -> DECISION
+	local cpu="$1" modem="$2" now="$3" c s ok
+	DECISION=none
+	c=$(tg_candidate "$cpu" "$modem" "$now")
+
+	if [ "$c" -gt "$STAGE" ]; then
+		if [ "$c" -eq "$PENDING" ]; then
+			PENDING_N=$((PENDING_N + 1))
+		else
+			PENDING=$c; PENDING_N=1
+		fi
+		if [ "$PENDING_N" -ge 2 ]; then
+			s=$((STAGE + 1))
+			while [ "$s" -le "$c" ]; do
+				tg_enter_stage "$s" "$cpu" "$modem" "$now"
+				s=$((s + 1))
+			done
+			PENDING=-1; PENDING_N=0; COOLED=0
+			DECISION="stage:$c"
+		fi
+		return 0
+	fi
+
+	PENDING=-1; PENDING_N=0
+
+	# Cooling down is reported once. Nothing is taken back, a missing reading counts as cool.
+	if [ "$STAGE" -ge 0 ] && [ "$COOLED" = 0 ]; then
+		ok=1
+		[ -n "$cpu" ] && [ "$cpu" -gt $((CPU_WARN - HYSTERESIS)) ] && ok=0
+		[ -n "$modem" ] && [ "$modem" -gt $((MODEM_WARN - HYSTERESIS)) ] && ok=0
+		[ "$ok" = 1 ] && { COOLED=1; DECISION=cooled; }
+	fi
+}
+
+# ---- logging and notification ----------------------------------------------
+tg_log() {
+	# Never let logging fail a caller, not even where logger is missing.
+	logger -t "$TAG" "$1" 2>/dev/null
+	mkdir -p "$STATE_DIR"
+	printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$EVLOG"
+	[ "$(wc -l < "$EVLOG")" -gt 50 ] && { tail -n 50 "$EVLOG" > "$EVLOG.tmp" && mv "$EVLOG.tmp" "$EVLOG"; }
+	return 0
+}
+
+# Complaints about the configuration, which only the daemon should report.
+# Every entry point runs the same validation, so a one-shot command logging
+# them repeats the same lines on every call: three "thermal-guard status" runs
+# produced three identical entries on a board without a sensor. The event log
+# keeps 50 lines, so a monitoring check calling status in a loop would flush
+# out the record of an actual incident within the hour.
+tg_cfg_log() {
+	[ "$DAEMON" = 1 ] && tg_log "$1"
+	return 0
+}
+
+# True when there is any way to deliver a message at all.
+tg_notify_configured() {
+	[ -n "$NOTIFY_URL" ] || [ -x "$HOOK_DIR/notify" ]
+}
+
+# Try HTTP first, fall back to the hook. Either may be configured on its own.
+tg_notify_send() { # $1 text
+	tg_notify_http "$1" && return 0
+	tg_notify_hook "$1"
+}
+
+tg_notify() { # $1 stage or event, $2 text
+	local text
+	text="[$(cat /proc/sys/kernel/hostname 2>/dev/null)] $TAG: $2"
+	tg_log "$2"
+	tg_notify_configured || return 0
+	mkdir -p "$STATE_DIR"
+
+	# From stage 1 on we may be about to switch off the only uplink. Queue the
+	# message instead of losing it, the daemon retries while a route exists.
+	case "$1" in
+		0|reset|cooled) ;;
+		*) tg_alt_uplink || {
+			printf '%s %s\n' "$(date '+%F %T')" "$2" >> "$OUTBOX"
+			tg_log "no alternative uplink, message queued"
+			return 0
+		} ;;
+	esac
+
+	tg_notify_send "$text" && return 0
+	printf '%s %s\n' "$(date '+%F %T')" "$2" >> "$OUTBOX"
+	return 0
+}
+
+LAST_FLUSH=0
+tg_flush_outbox() {
+	local now
+	[ -s "$OUTBOX" ] || return 0
+	tg_notify_configured || return 0
+	if [ "$STAGE" -ge 0 ]; then tg_alt_uplink || return 0; else tg_any_uplink || return 0; fi
+	now=$(date +%s)
+	[ $((now - LAST_FLUSH)) -ge 120 ] || return 0
+	LAST_FLUSH=$now
+	if tg_notify_send "$(printf '[%s] %s queued messages:\n%s' \
+		"$(cat /proc/sys/kernel/hostname 2>/dev/null)" "$TAG" "$(cat "$OUTBOX")")"; then
+		: > "$OUTBOX"
+		tg_log "queued messages delivered"
+	fi
+	return 0
+}
+
+# ---- actions ---------------------------------------------------------------
+# Returns what the action returned. A stage that could not do what it promised
+# has to be visible: on a box with a dead fan, "modem off" quietly failing is
+# the difference between a warm modem and a dead one.
+tg_run_action() { # $1 action name, $2 hook name for the "command" action
+	case "$1" in
+		modem_radio_off) tg_action_modem_radio_off ;;
+		wifi_off) tg_action_wifi_off ;;
+		interface_down) tg_action_interface_down ;;
+		command) tg_run_hook "$2" ;;
+		none|'') return 0 ;;
+		*) tg_log "unknown action '$1', doing nothing"; return 1 ;;
+	esac
+}
+
+# The reverse of a stage action, on reset. A hook has no reverse; the operator
+# who wrote it knows what to undo.
+tg_undo_action() { # $1 action name
+	case "$1" in
+		modem_radio_off) tg_action_modem_radio_on || tg_log "could not switch the modem back on" ;;
+		wifi_off) tg_action_wifi_on ;;
+		interface_down) tg_action_interface_up || tg_log "could not bring the interface back up" ;;
+	esac
+	return 0
+}
+
+# Runs an executable from the hook directory. Says so when the action asks for
+# a hook that is not there, because a stage that silently does nothing is the
+# failure this daemon exists to avoid.
+tg_run_hook() { # $1 hook name
+	local hook="$HOOK_DIR/$1"
+	if [ ! -x "$hook" ]; then
+		tg_log "action is set to 'command' but $hook is missing or not executable"
+		return 1
+	fi
+	"$hook" >/dev/null 2>&1
+}
+
+tg_act() { # $1 stage, $2 cpu, $3 modem
+	case "$1" in
+		0)
+			if [ "$FAN_MODE" = none ]; then
+				tg_notify 0 "stage 0: cpu ${2:-?} C, modem ${3:-?} C, fan left to its own controller. Check the fan."
+				return 0
+			fi
+			tg_notify 0 "stage 0: cpu ${2:-?} C, modem ${3:-?} C, forcing fan to full speed. Check the fan."
+			[ "$DRY" = 1 ] && return 0
+			tg_fan_full || tg_log "could not force the fan (mode $FAN_MODE)"
+			;;
+		1)
+			tg_notify 1 "stage 1: cpu ${2:-?} C, modem ${3:-?} C, running $STAGE1_ACTION."
+			[ "$DRY" = 1 ] && return 0
+			tg_run_action "$STAGE1_ACTION" stage1 ||
+				tg_notify 1 "stage 1 action '$STAGE1_ACTION' failed, the box is still hot"
+			;;
+		2)
+			tg_notify 2 "stage 2: cpu ${2:-?} C, modem ${3:-?} C, running $STAGE2_ACTION."
+			[ "$DRY" = 1 ] && return 0
+			tg_run_action "$STAGE2_ACTION" stage2 ||
+				tg_notify 2 "stage 2 action '$STAGE2_ACTION' failed, the box is still hot"
+			;;
+	esac
+}
+
+# Read GEN straight from the file, without disturbing the decision we are
+# holding in memory. tg_state_load would overwrite all of it.
+tg_state_gen() {
+	local g
+	[ -r "$STATE" ] || { echo "$GEN"; return; }
+	g=$(tg_int "$(sed -n 's/^GEN=//p' "$STATE" | head -n1)")
+	echo "${g:-0}"
+}
+
+# True while no reset happened since $1 was taken. On a reset it adopts the
+# cleared state and refreshes the status file, so the UI shows what the
+# operator did rather than our stale view.
+tg_state_unchanged() { # $1 GEN snapshot, empty skips the check
+	[ -n "$1" ] || return 0
+	[ "$(tg_state_gen)" = "$1" ] && return 0
+	tg_log "reset during this cycle, dropping the decision"
+	tg_state_load
+	tg_status_write
+	return 1
+}
+
+tg_cycle() { # $1 cpu, $2 modem, $3 now, $4 GEN when the state was loaded
+	local d s gen="${4:-}"
+	tg_decide "$1" "$2" "$3"
+	LAST_CPU=$1; LAST_MODEM=$2; LAST_TS=$3
+	LAST_MODEM_SRC=$MODEM_SRC
+	[ -n "$2" ] || LAST_MODEM_SRC=""
+
+	# Check before acting, not just before saving. Reading the modem takes
+	# seconds, and a Clear pressed in that window has already handed the fan
+	# back. Acting now would force it again while the state says idle.
+	tg_state_unchanged "$gen" || return 0
+
+	case "$DECISION" in
+		stage:*)
+			d=${DECISION#stage:}
+			# run skipped stages too, a jump from idle to emergency still needs the fan
+			s=$FROM_STAGE
+			while [ "$s" -le "$d" ]; do
+				tg_act "$s" "$1" "$2"
+				s=$((s + 1))
+			done
+			;;
+		cooled)
+			tg_notify cooled "cooled down: cpu ${1:-?} C, modem ${2:-?} C. Stage $STAGE stays active, clear it with 'thermal-guard reset'."
+			;;
+	esac
+
+	# And again: the actions above can take a while too.
+	tg_state_unchanged "$gen" || return 0
+
+	# A dry run reports and returns. It must not leave behind a stage that no
+	# action was taken for: "thermal-guard test 95 95" on a live box would
+	# otherwise persist stage 2, and the next boot would act on it.
+	[ "$DRY" = 1 ] && return 0
+
+	tg_state_save
+	# Only stage changes reach the overlay, see tg_state_persist.
+	case "$DECISION" in stage:*) tg_state_persist ;; esac
+	tg_status_write
+}
+
+# ---- persistence -----------------------------------------------------------
+tg_state_save() {
+	mkdir -p "$STATE_DIR"
+	tg_state_write "$STATE"
+}
+
+# Mirror to the overlay. Called on stage changes only, so the flash sees a
+# handful of writes per incident instead of one every interval.
+tg_state_persist() {
+	mkdir -p "$PERSIST_DIR" 2>/dev/null || return 0
+	tg_state_write "$PERSIST"
+}
+
+tg_state_write() { # $1 target file
+	cat > "$1.tmp" <<-EOF
+		STAGE=$STAGE
+		T0=$T0
+		T1=$T1
+		T2=$T2
+		REF_CPU0=$REF_CPU0
+		REF_MODEM0=$REF_MODEM0
+		REF_CPU1=$REF_CPU1
+		REF_MODEM1=$REF_MODEM1
+		PENDING=$PENDING
+		PENDING_N=$PENDING_N
+		COOLED=$COOLED
+		LAST_CPU=$LAST_CPU
+		LAST_MODEM=$LAST_MODEM
+		LAST_MODEM_SRC=$LAST_MODEM_SRC
+		LAST_TS=$LAST_TS
+		FAN_SAVED_ENABLE=$FAN_SAVED_ENABLE
+		FAN_SAVED_PWM=$FAN_SAVED_PWM
+		FAN_SAVED_POLICY=$FAN_SAVED_POLICY
+		GEN=$GEN
+	EOF
+	mv "$1.tmp" "$1"
+}
+
+# Only known keys with integer or empty values, the file is also written by "reset".
+tg_state_load() {
+	tg_state_clear
+	tg_state_read "$STATE"
+}
+
+tg_state_read() { # $1 source file
+	[ -r "$1" ] || return 0
+	while IFS='=' read -r k v; do
+		case "$k" in
+			STAGE|T0|T1|T2|REF_CPU0|REF_MODEM0|REF_CPU1|REF_MODEM1|PENDING|PENDING_N|COOLED|LAST_TS|GEN)
+				[ -n "$(tg_int "$v")" ] && eval "$k=\$v" ;;
+			LAST_CPU|LAST_MODEM|FAN_SAVED_ENABLE|FAN_SAVED_PWM)
+				eval "$k=\$(tg_int \"\$v\")" ;;
+			LAST_MODEM_SRC)
+				case "$v" in file|command|at|test) LAST_MODEM_SRC=$v ;; *) LAST_MODEM_SRC="" ;; esac ;;
+			# Governor names, not free text: this value is written back to sysfs.
+			FAN_SAVED_POLICY)
+				case "$v" in
+					step_wise|fair_share|bang_bang|user_space|power_allocator)
+						FAN_SAVED_POLICY=$v ;;
+					*) FAN_SAVED_POLICY="" ;;
+				esac ;;
+		esac
+	done < "$1"
+}
+
+# After a reboot /var/run is empty while the overlay may still hold a stage. The
+# box did not get a new fan while it was down, so the mitigations go back on.
+# Restoring the stage without reapplying would be the worst of both: the daemon
+# would consider itself fully escalated and stop reacting, while nothing is
+# actually in force.
+tg_state_restore() {
+	local s
+	[ -r "$STATE" ] && return 0
+	[ -r "$PERSIST" ] || return 0
+
+	tg_state_clear
+	tg_state_read "$PERSIST"
+	[ "$STAGE" -ge 0 ] || return 0
+
+	tg_notify "$STAGE" "restored stage $STAGE after a reboot, reapplying its actions. Clear it with 'thermal-guard reset' once the cause is fixed."
+	s=0
+	while [ "$s" -le "$STAGE" ]; do
+		tg_reapply "$s"
+		s=$((s + 1))
+	done
+	tg_state_save
+}
+
+# The effects of a stage without its announcement, for the reboot path where one
+# message covers the whole restore.
+tg_reapply() { # $1 stage
+	case "$1" in
+		0) [ "$FAN_MODE" = none ] || tg_fan_full || tg_log "could not force the fan (mode $FAN_MODE)" ;;
+		1) tg_run_action "$STAGE1_ACTION" stage1 ;;
+		2) tg_run_action "$STAGE2_ACTION" stage2 ;;
+	esac
+}
+
+# Machine readable snapshot for the LuCI page, so the UI never talks to the modem.
+tg_status_write() {
+	cat > "$STATUS_FILE.tmp" <<-EOF
+		version=$THERMAL_GUARD_VERSION
+		ts=$LAST_TS
+		now=$(date +%s)
+		interval=$INTERVAL
+		enabled=$ENABLED
+		stage=$STAGE
+		cooled=$COOLED
+		cpu_c=$LAST_CPU
+		cpu_src=$CPU_TEMP_PATH
+		no_sensor=$NO_SENSOR
+		modem_c=$LAST_MODEM
+		modem_src=$LAST_MODEM_SRC
+		cpu_warn=$CPU_WARN
+		cpu_crit=$CPU_CRIT
+		cpu_emergency=$CPU_EMERGENCY
+		modem_warn=$MODEM_WARN
+		modem_crit=$MODEM_CRIT
+		fan_mode=$FAN_MODE
+		fan_view=$FAN_VIEW
+		fan_state=$(tg_fan_state)
+		fan_max=$(tg_fan_max)
+		fan_percent=$(tg_fan_percent)
+		fan_foreign=$FAN_FOREIGN
+		fan_rpm=$(tg_fan_rpm)
+		stage1_action=$STAGE1_ACTION
+		stage2_action=$STAGE2_ACTION
+		trip_state=$TRIP_STATE
+		trip_reason=$TRIP_REASON
+		trip_boost=$TRIP_BOOST
+		trip_zone=$TRIP_ZONE
+		trip_base=$(tg_trip_deg "$TRIP_BASE")
+		trip_now=$(tg_trip_deg "$TRIP_NOW")
+		trip_dt=$(tg_trip_deg "$TRIP_DT")
+		trip_delta=$((TRIP_DELTA / 1000))
+		trip_dt_changed=$TRIP_DT_CHANGED
+		trip_limit=$(tg_trip_deg "$TRIP_LIMIT")
+		fan_levels=$(tg_fan_levels)
+		t0=$T0
+		t1=$T1
+		t2=$T2
+	EOF
+	# One line per extra sensor, prefixed so the UI can pick them out.
+	tg_read_extra_sensors | while IFS='=' read -r n v; do
+		printf 'sensor.%s=%s
+' "$n" "$v"
+	done >> "$STATUS_FILE.tmp"
+	chmod 644 "$STATUS_FILE.tmp" 2>/dev/null
+	mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+
+# ---- configuration ---------------------------------------------------------
+tg_cfg_int() { # $1 option, $2 variable
+	local v
+	v=$(uci -q get "thermal-guard.main.$1")
+	[ -n "$(tg_int "$v")" ] && eval "$2=\$v"
+	return 0
+}
+
+tg_cfg_str() {
+	local v
+	v=$(uci -q get "thermal-guard.main.$1")
+	[ -n "$v" ] && eval "$2=\$v"
+	return 0
+}
+
+# UCI can name any file. Keep every path inside the subtree it belongs to, fall
+# back to the default where there is one and drop the feature where there is not.
+tg_cfg_validate_paths() {
+	if ! tg_path_sensor "$CPU_TEMP_PATH"; then
+		tg_cfg_log "rejecting cpu_temp_path '$CPU_TEMP_PATH', using default"
+		CPU_TEMP_PATH="$THERMAL_ROOT/thermal_zone0/temp"
+	fi
+	if [ -n "$FAN_CDEV" ] && ! tg_path_thermal "$FAN_CDEV"; then
+		tg_cfg_log "rejecting fan_cooling_device '$FAN_CDEV'"
+		FAN_CDEV=""
+	fi
+	if [ -n "$FAN_ZONE" ] && ! tg_path_thermal "$FAN_ZONE"; then
+		tg_cfg_log "rejecting fan_thermal_zone '$FAN_ZONE'"
+		FAN_ZONE=""
+	fi
+	if [ -n "$PWM_PATH" ] && ! tg_path_hwmon "$PWM_PATH"; then
+		tg_cfg_log "rejecting pwm_path '$PWM_PATH'"
+		PWM_PATH=""
+	fi
+	if [ -n "$PWM_ENABLE_PATH" ] && ! tg_path_hwmon "$PWM_ENABLE_PATH"; then
+		tg_cfg_log "rejecting pwm_enable_path '$PWM_ENABLE_PATH'"
+		PWM_ENABLE_PATH=""
+	fi
+	if [ -n "$MODEM_TEMP_FILE" ] && ! tg_path_modem_file "$MODEM_TEMP_FILE"; then
+		tg_cfg_log "rejecting modem_temp_file '$MODEM_TEMP_FILE'"
+		MODEM_TEMP_FILE=""
+	fi
+	if [ "$MODEM_AT_PORT" != auto ] && ! tg_path_dev "$MODEM_AT_PORT"; then
+		tg_cfg_log "rejecting modem_at_port '$MODEM_AT_PORT', using auto"
+		MODEM_AT_PORT=auto
+	fi
+	if ! tg_path_lock "$AT_LOCK"; then
+		tg_cfg_log "rejecting at_lock '$AT_LOCK', using default"
+		AT_LOCK=/var/lock/modem-at.lock
+	fi
+}
+
+# Reads UCI where it exists and always ends with the checks that have to run
+# either way, so a run without uci behaves like one with an empty config.
+tg_cfg() {
+	tg_cfg_from_uci
+	tg_cfg_validate_paths
+	tg_cpu_detect
+}
+
+tg_cfg_from_uci() {
+	command -v uci >/dev/null 2>&1 || return 0
+	tg_cfg_int enabled ENABLED
+	tg_cfg_int interval INTERVAL
+	tg_cfg_int cpu_warn CPU_WARN
+	tg_cfg_int cpu_crit CPU_CRIT
+	tg_cfg_int cpu_emergency CPU_EMERGENCY
+	tg_cfg_int modem_warn MODEM_WARN
+	tg_cfg_int modem_crit MODEM_CRIT
+	tg_cfg_int hold_minutes HOLD_MINUTES
+	tg_cfg_int hysteresis HYSTERESIS
+	tg_cfg_int pwm_full PWM_FULL
+	tg_cfg_int pwm_idle PWM_IDLE
+	tg_cfg_str cpu_temp_path CPU_TEMP_PATH
+	tg_cfg_str fan_mode FAN_MODE
+	tg_cfg_str fan_cooling_device FAN_CDEV
+	tg_cfg_str fan_cooling_device_type FAN_CDEV_TYPE
+	tg_cfg_str fan_thermal_zone FAN_ZONE
+	tg_cfg_str fan_governor FAN_GOVERNOR
+	tg_cfg_str pwm_path PWM_PATH
+	tg_cfg_str pwm_enable_path PWM_ENABLE_PATH
+	tg_cfg_str modem_source MODEM_SOURCE
+	tg_cfg_str modem_at_port MODEM_AT_PORT
+	tg_cfg_str modem_temp_file MODEM_TEMP_FILE
+	tg_cfg_str at_lock AT_LOCK
+	tg_cfg_str notify_url NOTIFY_URL
+	tg_cfg_str notify_header NOTIFY_HEADER
+	tg_cfg_str stage1_action STAGE1_ACTION
+	tg_cfg_str stage2_action STAGE2_ACTION
+	tg_cfg_str uplink_interface UPLINK_INTERFACE
+	tg_cfg_str modem_radio_off_at MODEM_RADIO_OFF_AT
+	tg_cfg_str action_interface ACTION_INTERFACE
+	tg_cfg_int extra_sensors EXTRA_SENSORS
+	# Read straight, not through tg_cfg_str: clearing these has to take effect
+	# in the running daemon, that is how trip management is switched off.
+	TRIP_BOOST=$(uci -q get thermal-guard.main.trip_boost)
+	TRIP_ACTIVE=$(uci -q get thermal-guard.main.trip_active)
+	TRIP_DT_UCI=$(uci -q get thermal-guard.main.trip_dt)
+	TRIP_BOOST_OFFSET=$(uci -q get thermal-guard.main.trip_boost_offset)
+	tg_cfg_validate_trips
+
+	# Thresholds out of order would silently disable the guard, so fall back to defaults.
+	if [ "$CPU_WARN" -ge "$CPU_CRIT" ] || [ "$CPU_CRIT" -ge "$CPU_EMERGENCY" ] ||
+		[ "$MODEM_WARN" -ge "$MODEM_CRIT" ]; then
+		tg_cfg_log "implausible thresholds (cpu $CPU_WARN/$CPU_CRIT/$CPU_EMERGENCY, modem $MODEM_WARN/$MODEM_CRIT), using defaults"
+		CPU_WARN=70; CPU_CRIT=80; CPU_EMERGENCY=90; MODEM_WARN=80; MODEM_CRIT=88
+	fi
+	[ "$INTERVAL" -ge 5 ] || INTERVAL=5
+	tg_cfg_validate_actions
+}
+
+tg_cfg_validate_trips() {
+	case "${TRIP_BOOST:-off}" in
+		off|modem) TRIP_BOOST=${TRIP_BOOST:-off} ;;
+		*) tg_cfg_log "rejecting trip_boost '$TRIP_BOOST', using off"; TRIP_BOOST=off ;;
+	esac
+	if [ -z "$TRIP_BOOST_OFFSET" ]; then
+		TRIP_BOOST_OFFSET=15
+	elif [ -z "$(tg_int "$TRIP_BOOST_OFFSET")" ] || [ "$TRIP_BOOST_OFFSET" -lt 0 ] ||
+		[ "$TRIP_BOOST_OFFSET" -gt 40 ]; then
+		tg_cfg_log "rejecting trip_boost_offset '$TRIP_BOOST_OFFSET', using 15"
+		TRIP_BOOST_OFFSET=15
+	fi
+}
+
+tg_cfg_validate_actions() {
+	case "$MODEM_RADIO_OFF_AT" in
+		'AT+CFUN=4'|'AT+CFUN=0') ;;
+		*)
+			tg_cfg_log "rejecting modem_radio_off_at '$MODEM_RADIO_OFF_AT', using AT+CFUN=4"
+			MODEM_RADIO_OFF_AT='AT+CFUN=4'
+			;;
+	esac
+	if [ -n "$UPLINK_INTERFACE" ] && ! tg_iface_name_ok "$UPLINK_INTERFACE"; then
+		tg_cfg_log "rejecting uplink_interface '$UPLINK_INTERFACE'"
+		UPLINK_INTERFACE=""
+	fi
+	if [ -n "$ACTION_INTERFACE" ] && ! tg_iface_name_ok "$ACTION_INTERFACE"; then
+		tg_cfg_log "rejecting action_interface '$ACTION_INTERFACE'"
+		ACTION_INTERFACE=""
+	fi
+}
+
+# The default path fits mediatek and most ARM targets but not ramips or x86,
+# where the SoC sensor is a hwmon node. Rather than run blind on a board nobody
+# configured by hand, look for a working sensor and say which one we took.
+tg_cpu_detect() {
+	local found
+	NO_SENSOR=0
+	[ -r "$CPU_TEMP_PATH" ] && return 0
+
+	found=$(tg_find_cpu_sensor)
+	if [ -n "$found" ] && tg_path_sensor "$found"; then
+		if [ "$found" != "$CPU_SENSOR_LAST" ]; then
+			tg_cfg_log "cpu_temp_path '$CPU_TEMP_PATH' does not read, using '$found' instead"
+			CPU_SENSOR_LAST=$found
+		fi
+		CPU_TEMP_PATH=$found
+		return 0
+	fi
+
+	# Nothing to fall back to. Say which of the two cases this is, once, so the
+	# log does not read like a typo when it is a property of the board.
+	tg_has_any_sensor || NO_SENSOR=1
+	if [ "$NO_SENSOR" = 1 ] && [ "$CPU_SENSOR_LAST" != none ]; then
+		tg_cfg_log "this device reports no temperature at all, nothing to watch here"
+		CPU_SENSOR_LAST=none
+	fi
+}
+
+# ---- commands --------------------------------------------------------------
+tg_daemon() {
+	local cpu modem now blind_cpu=0 blind_modem=0 prev_src=""
+	# From here the configuration diagnostics are worth logging: this process
+	# stays, so each of them is said once rather than once per invocation.
+	DAEMON=1
+	mkdir -p "$STATE_DIR"
+	tg_cfg
+	tg_fan_detect
+	# Before the first load, so a reboot does not silently drop the stages.
+	tg_state_restore
+	tg_state_load
+	tg_log "started, version $THERMAL_GUARD_VERSION, stage $STAGE, fan mode $FAN_MODE, modem source $MODEM_SOURCE"
+
+	while :; do
+		# tg_cfg resets FAN_MODE to whatever UCI says, so the detection has to run
+		# again. It only reads sysfs, so doing it every cycle is cheap and also
+		# picks up a fan that appeared after boot.
+		tg_cfg
+		tg_fan_detect
+		# Paused, not stopped. Stages and a forced fan stay exactly as they
+		# are, because releasing them here would hide a broken fan behind a
+		# checkbox. Keep refreshing the status file so the web interface can
+		# say so instead of showing a snapshot that stopped ageing.
+		if [ "$ENABLED" = 0 ]; then
+			tg_state_load
+			tg_status_write
+			sleep "$INTERVAL"
+			continue
+		fi
+
+		cpu=$(tg_read_cpu)
+		tg_read_modem
+		modem=$MODEM_VAL
+		tg_modem_publish
+		now=$(date +%s)
+
+		# Only worth a notification where a sensor exists but does not read.
+		# On a board without any, tg_cpu_detect has already said so once and
+		# there is nothing an operator could fix.
+		if [ -z "$cpu" ] && [ "$blind_cpu" = 0 ] && [ "$NO_SENSOR" = 0 ]; then
+			tg_notify 0 "blind: cannot read cpu temperature from $CPU_TEMP_PATH"
+			blind_cpu=1
+		fi
+		[ -n "$cpu" ] && blind_cpu=0
+
+		if [ -z "$modem" ] && [ "$blind_modem" = 0 ] && [ "$MODEM_SOURCE" != none ]; then
+			tg_log "cannot read modem temperature"
+			blind_modem=1
+		fi
+		[ -n "$modem" ] && blind_modem=0
+
+		# Log a source change, otherwise a jump in the reading looks like physics.
+		if [ -n "$modem" ] && [ "$MODEM_SRC" != "$prev_src" ]; then
+			[ -n "$prev_src" ] && tg_log "modem reading now from '$MODEM_SRC' (was '$prev_src'): $modem C"
+			prev_src=$MODEM_SRC
+		fi
+
+		# The state file is the single source of truth, "reset" writes it from
+		# outside. Load it after the modem read so a reset in between survives.
+		tg_state_load
+		# Needs the loaded stage to know whether the fan should be forced.
+		tg_fan_check_owner
+		tg_trip_cycle "$cpu" "$modem"
+		FROM_STAGE=$((STAGE + 1))
+		tg_cycle "$cpu" "$modem" "$now" "$GEN"
+		tg_flush_outbox
+		sleep "$INTERVAL"
+	done
+}
+
+tg_status() {
+	tg_cfg
+	tg_fan_detect
+	tg_state_load
+	echo "version=$THERMAL_GUARD_VERSION"
+	echo "stage=$STAGE"
+	echo "cooled=$COOLED"
+	echo "gen=$GEN"
+	echo "last_cpu=$LAST_CPU"
+	echo "cpu_temp_path=$CPU_TEMP_PATH"
+	echo "last_modem=$LAST_MODEM"
+	echo "last_modem_src=$LAST_MODEM_SRC"
+	echo "last_ts=$LAST_TS"
+	echo "t0=$T0"; echo "t1=$T1"; echo "t2=$T2"
+	echo "pending=$PENDING"; echo "pending_n=$PENDING_N"
+	echo "fan_mode=$FAN_MODE"
+	echo "fan_state=$(tg_fan_state)"
+	echo "fan_max=$(tg_fan_max)"
+	echo "outbox_lines=$([ -f "$OUTBOX" ] && wc -l < "$OUTBOX" || echo 0)"
+	echo "alt_uplink=$(tg_alt_uplink && echo 1 || echo 0)"
+}
+
+tg_reset() {
+	local hist gen
+	tg_cfg
+	tg_fan_detect
+	tg_state_load
+	tg_log "reset requested (stage $STAGE)"
+
+	[ "$STAGE" -ge 1 ] && tg_undo_action "$STAGE1_ACTION"
+	[ "$STAGE" -ge 2 ] && tg_undo_action "$STAGE2_ACTION"
+	# Unconditional, not "if we think we took the fan". Reset means hand it
+	# back, and the one case where the stage says idle but the fan is still
+	# forced is exactly the one an operator cannot fix any other way.
+	tg_fan_release
+
+	hist=$(tail -n 10 "$EVLOG" 2>/dev/null)
+	gen=$((GEN + 1))
+	tg_state_clear
+	GEN=$gen
+	# Clearing means clearing, including across the next reboot.
+	rm -f "$PERSIST" 2>/dev/null
+	tg_state_save
+	tg_status_write
+	tg_log "reset done"
+
+	tg_notify_configured || return 0
+	if tg_notify_send "$(printf '[%s] %s: reset done. Recent events:\n%s' \
+		"$(cat /proc/sys/kernel/hostname 2>/dev/null)" "$TAG" "$hist")"; then
+		: > "$OUTBOX" 2>/dev/null
+	else
+		mkdir -p "$STATE_DIR"
+		printf '%s reset done (history: logread -e %s)\n' "$(date '+%F %T')" "$TAG" >> "$OUTBOX"
+	fi
+	return 0
+}
+
+tg_test() { # feed readings through one cycle, actions are logged only
+	[ -n "$(tg_int "${1:-}")" ] || { echo "usage: thermal-guard test <cpu> <modem>" >&2; exit 2; }
+	tg_cfg
+	tg_state_load
+	# Dry run: decide and report, touch no hardware and send nothing.
+	DRY=1; NOTIFY_URL=""; HOOK_DIR=/nonexistent; MODEM_SRC="test"
+	FROM_STAGE=$((STAGE + 1))
+	tg_cycle "$1" "$(tg_int "${2:-}")" "$(date +%s)"
+	echo "decision=$DECISION stage=$STAGE pending=$PENDING/$PENDING_N cooled=$COOLED"
+}
+
+# ---- self test of the decision logic ---------------------------------------
+tg_selftest() {
+	local fail=0 r dir
+	# Runs on live boards next to the daemon, so nothing of the installation may
+	# be touched: its own state, log and hook directories, and no syslog lines.
+	dir=$(mktemp -d 2>/dev/null) || return 1
+	STATE_DIR="$dir/run"; STATE="$STATE_DIR/state"; OUTBOX="$STATE_DIR/outbox"
+	EVLOG="$STATE_DIR/log"; PERSIST_DIR="$dir/persist"; PERSIST="$PERSIST_DIR/state"
+	STATUS_FILE="$dir/status"; HOOK_DIR="$dir/hooks"
+	mkdir -p "$STATE_DIR"
+	logger() { :; }
+	chk() {
+		if [ "$2" = "$3" ]; then
+			echo "ok   $1"
+		else
+			echo "FAIL $1: expected [$3], got [$2]"
+			fail=1
+		fi
+	}
+	CPU_WARN=70; CPU_CRIT=80; CPU_EMERGENCY=90; MODEM_WARN=80; MODEM_CRIT=88
+	HOLD_MINUTES=3; HYSTERESIS=10
+
+	tg_state_clear; tg_decide 55 65 1000; chk "idle stays none" "$DECISION/$STAGE" "none/-1"
+	tg_state_clear; tg_decide 72 65 1000; chk "single hit is a glitch" "$DECISION/$STAGE" "none/-1"
+	tg_decide 60 65 1020; tg_decide 72 65 1040; chk "glitch resets the counter" "$DECISION/$PENDING_N" "none/1"
+	tg_decide 72 65 1060; chk "two hits reach stage 0" "$DECISION/$STAGE/$REF_CPU0" "stage:0/0/72"
+	tg_decide 72 65 1080; chk "stage 0 holds" "$DECISION/$STAGE" "none/0"
+	tg_decide 73 66 1200; tg_decide 73 66 1220; chk "before hold no stage 1" "$DECISION/$STAGE" "none/0"
+	tg_decide 73 66 1245; tg_decide 73 66 1265; chk "hold without drop reaches stage 1" "$DECISION/$STAGE/$REF_CPU1" "stage:1/1/73"
+	tg_decide 73 66 1300; tg_decide 73 66 1500; chk "stage 1 steady stays" "$DECISION/$STAGE" "none/1"
+	tg_decide 74 66 1520; tg_decide 74 66 1540; chk "stage 1 plus rise reaches stage 2" "$DECISION/$STAGE" "stage:2/2"
+
+	tg_state_clear; tg_decide 65 66 2000; tg_decide 60 65 2020; tg_decide 62 66 2040
+	tg_decide 61 82 2060; tg_decide 61 82 2080; chk "modem alone reaches stage 0" "$DECISION/$STAGE" "stage:0/0"
+	tg_decide 61 90 2100; tg_decide 61 90 2120; chk "modem crit skips the hold" "$DECISION/$STAGE" "stage:1/1"
+
+	tg_state_clear; tg_decide 91 60 3000; tg_decide 91 60 3020; chk "cpu emergency jumps to stage 2" "$DECISION/$STAGE/$T0/$T1" "stage:2/2/3020/3020"
+
+	tg_state_clear; tg_decide 75 "" 4000; tg_decide 75 "" 4020; chk "cpu only without modem" "$DECISION/$STAGE" "stage:0/0"
+	tg_decide 55 "" 4040; chk "cooled, missing modem counts as cool" "$DECISION/$COOLED" "cooled/1"
+	tg_decide 55 "" 4060; chk "cooled is reported once" "$DECISION/$STAGE" "none/0"
+	tg_decide 72 60 4080; tg_decide 72 60 4100; chk "no rollback, no new transition" "$DECISION/$STAGE" "none/0"
+
+	tg_state_clear; tg_decide 79 87 5000; tg_decide 79 87 5020; chk "just below crit reaches stage 0" "$DECISION/$STAGE" "stage:0/0"
+	tg_decide 61 71 5040; chk "hysteresis not reached (71 > 70)" "$DECISION" "none"
+	tg_decide 60 70 5060; chk "hysteresis reached" "$DECISION" "cooled"
+
+	# Path guards. UCI must not be able to aim the daemon outside these subtrees.
+	chk_path() { # $1 guard, $2 path, $3 accept or reject
+		if "$1" "$2"; then
+			chk "$1 '$2'" accept "$3"
+		else
+			chk "$1 '$2'" reject "$3"
+		fi
+	}
+	chk_path tg_path_thermal /sys/class/thermal/thermal_zone0/temp accept
+	chk_path tg_path_thermal /etc/passwd reject
+	chk_path tg_path_thermal /sys/class/thermal/../../../etc/passwd reject
+	chk_path tg_path_thermal sys/class/thermal/thermal_zone0/temp reject
+	chk_path tg_path_thermal '' reject
+	chk_path tg_path_hwmon /sys/class/hwmon/hwmon0/pwm1 accept
+	chk_path tg_path_hwmon /etc/shadow reject
+	# x86 with coretemp reports the SoC through hwmon, not a thermal zone
+	chk_path tg_path_sensor /sys/class/thermal/thermal_zone0/temp accept
+	chk_path tg_path_sensor /sys/class/hwmon/hwmon0/temp1_input accept
+	chk_path tg_path_sensor /etc/passwd reject
+	chk_path tg_path_modem_file /tmp/modem.temp accept
+	chk_path tg_path_lock /var/lock/modem-at.lock accept
+	chk_path tg_path_lock /var/run/modem-at.lock accept
+	chk_path tg_path_lock /tmpfoo/evil reject
+	chk_path tg_path_dev /dev/ttyUSB2 accept
+	chk_path tg_path_dev /tmp/x reject
+
+	# Reset race. A reset landing mid cycle has to win: the daemon drops its
+	# decision instead of writing the stage it was still holding back.
+	chk_gate() { # $1 label, $2 GEN snapshot, $3 go or stop
+		if tg_state_unchanged "$2"; then
+			chk "$1" go "$3"
+		else
+			chk "$1" stop "$3"
+		fi
+	}
+	tg_state_clear; STAGE=1; GEN=5; tg_state_save
+	# Fan percentage has to read the same on a board whose scale descends.
+	FAN_MODE=pwm; FAN_VIEW=pwm
+	PWM_IDLE=0; PWM_FULL=200
+	chk "rising scale, half speed" "$(tg_fan_percent 100)" "50"
+	PWM_IDLE=200; PWM_FULL=0
+	chk "inverted scale, half speed" "$(tg_fan_percent 100)" "50"
+
+	# The Banana Pi R3 Mini runs this way round: 1 is full speed, 255 stops it.
+	PWM_IDLE=255; PWM_FULL=1
+	chk "inverted board at full speed" "$(tg_fan_percent 1)" "100"
+	chk "inverted board stopped" "$(tg_fan_percent 255)" "0"
+	chk "inverted board, measured value" "$(tg_fan_percent 89)" "65"
+
+	# A value outside the configured span must not leave 0..100.
+	chk "out of range clamps" "$(tg_fan_percent 300)" "0"
+	chk "a garbled reading yields nothing" "$(tg_fan_percent '9;reboot')" ""
+
+	# Polarity is never assumed. pwm without both values must not touch the fan,
+	# and auto must not pick pwm at all, since it cannot know the polarity.
+	printf '100\n' > "$STATE_DIR/pwm1"; printf '1\n' > "$STATE_DIR/pwm1_enable"
+	PWM_PATH="$STATE_DIR/pwm1"; PWM_ENABLE_PATH="$STATE_DIR/pwm1_enable"
+	PWM_FULL=1; PWM_IDLE=255; FAN_MODE=pwm; tg_fan_detect
+	chk "pwm with both values set" "$FAN_MODE" "pwm"
+	PWM_FULL=""; PWM_IDLE=255; FAN_MODE=pwm; tg_fan_detect
+	chk "pwm without pwm_full stays off the fan" "$FAN_MODE" "none"
+	PWM_FULL=1; PWM_IDLE=""; FAN_MODE=pwm; tg_fan_detect
+	chk "pwm without pwm_idle stays off the fan" "$FAN_MODE" "none"
+	PWM_FULL=1; PWM_IDLE=255; FAN_CDEV_TYPE=no-such-cooling-device
+	FAN_CDEV=""; FAN_MODE=auto; tg_fan_detect
+	chk "auto never resolves to pwm" "$FAN_MODE" "none"
+
+	# Reading is separate from writing. With the fan left to another controller
+	# the page still shows it, from the raw pwm output where the polarity is
+	# known: a cooling device's cur_state is derived from cooling-levels, and on
+	# a board whose levels descend it reads full speed as stopped.
+	FAN_CDEV_TYPE=no-such-cooling-device; FAN_CDEV=""
+	PWM_FULL=1; PWM_IDLE=255; FAN_MODE=none; tg_fan_detect
+	chk "none still writes nothing" "$FAN_MODE" "none"
+	chk "none reads the pwm output when the polarity is known" "$FAN_VIEW" "pwm"
+	chk "and shows it as a percentage" "$(tg_fan_percent 1)" "100"
+	PWM_FULL=""; PWM_IDLE=""; FAN_MODE=none; tg_fan_detect
+	chk "without a polarity the raw output is still read" "$FAN_VIEW" "pwm"
+	chk "but not turned into a percentage" "$(tg_fan_percent 1)" ""
+	# Only where the board has no fan chip: on one that does, it is found by
+	# its hwmon name and read, which is the point.
+	if [ -z "$(tg_fan_find_hwmon)" ]; then
+		PWM_PATH=""; PWM_ENABLE_PATH=""; FAN_MODE=none; tg_fan_detect
+		chk "nothing to read, nothing shown" "$FAN_VIEW" "none"
+	fi
+	PWM_PATH="$STATE_DIR/pwm1"; PWM_ENABLE_PATH="$STATE_DIR/pwm1_enable"
+	PWM_FULL=1; PWM_IDLE=255; FAN_MODE=pwm; tg_fan_detect
+	chk "a driven fan is read the way it is written" "$FAN_VIEW" "pwm"
+
+	FAN_CDEV_TYPE=pwm-fan; PWM_PATH=""; PWM_ENABLE_PATH=""
+	FAN_MODE=none; PWM_IDLE=""; PWM_FULL=""
+
+	# With the fan left to another controller, stage 1 of 3 is a warning. Not
+	# touching the fan is the configuration, not a failure to report.
+	: > "$EVLOG"
+	tg_reapply 0
+	chk "stage 0 with fan_mode none logs no fan failure" \
+		"$(grep -c 'could not force the fan' "$EVLOG")" "0"
+
+	# Hooks. The whole point is that only a file on disk can carry code, so an
+	# action asking for one that is missing or not executable must do nothing
+	# and report failure rather than fall back to something.
+	HOOK_DIR="$STATE_DIR/hooks"
+	mkdir -p "$HOOK_DIR"
+	printf '#!/bin/sh\necho ran > "%s"\n' "$STATE_DIR/hook-ran" > "$HOOK_DIR/stage1"
+
+	rm -f "$STATE_DIR/hook-ran"
+	chmod 0644 "$HOOK_DIR/stage1"
+	# Skipped where the filesystem has no execute bit to clear, which is the
+	# case when the tests run from a Windows checkout.
+	if [ -x "$HOOK_DIR/stage1" ]; then
+		echo "skip a hook without the execute bit (filesystem has no such bit)"
+	else
+		tg_run_hook stage1 >/dev/null 2>&1 && r=ran || r=refused
+		chk "a hook without the execute bit is refused" "$r" "refused"
+		chk "and it really did not run" "$(cat "$STATE_DIR/hook-ran" 2>/dev/null)" ""
+	fi
+
+	chmod 0755 "$HOOK_DIR/stage1"
+	tg_run_hook stage1 >/dev/null 2>&1 && r=ran || r=refused
+	chk "an executable hook runs" "$r" "ran"
+	chk "and it did what it says" "$(cat "$STATE_DIR/hook-ran" 2>/dev/null)" "ran"
+
+	tg_run_hook nosuchhook >/dev/null 2>&1 && r=ran || r=refused
+	chk "a missing hook is refused" "$r" "refused"
+
+	# "command" without a hook must not silently look like success.
+	tg_run_action command nosuchhook >/dev/null 2>&1 && r=ok || r=failed
+	chk "an action with no hook reports failure" "$r" "failed"
+	HOOK_DIR=/nonexistent
+
+	# Notification address. Anything that ends a quoted value in a curl config
+	# file, or starts a new line in one, must never reach it: curl config knows
+	# directives that write files.
+	chk_http() { # $1 label, $2 value, $3 accept or reject
+		if tg_http_safe "$2"; then
+			chk "$1" accept "$3"
+		else
+			chk "$1" reject "$3"
+		fi
+	}
+	chk_http "a plain url" 'https://ntfy.sh/my-topic' accept
+	chk_http "a url with a query" 'https://host/x?auth=abc123%3D' accept
+	chk_http "a bearer header" 'Authorization: Bearer abc.def-ghi_jkl' accept
+	chk_http "a url with a quote" 'https://x/" output = /etc/rc.local' reject
+	# shellcheck disable=SC1003  # a literal backslash is the point of the case
+	chk_http "a url with a backslash" 'https://x/\' reject
+	chk_http "a url with a newline" 'https://x/
+output = /etc/rc.local' reject
+	chk_http "a url with a tab" "$(printf 'https://x/\ty')" reject
+	chk_http "an empty value" '' reject
+
+	chk "GEN survives save and load" "$(tg_state_gen)" "5"
+	chk_gate "untouched state continues the cycle" 5 go
+
+	# a reset rewrites the file while we still hold stage 1 in memory
+	tg_state_clear; GEN=6; tg_state_save
+	STAGE=1; GEN=5
+	chk_gate "bumped GEN aborts the cycle" 5 stop
+	chk "aborted cycle adopts the reset state" "$STAGE/$GEN" "-1/6"
+
+	# The saved fan state is what the release writes back, so it has to survive
+	# the round trip through the state file like everything else.
+	tg_state_clear; FAN_SAVED_ENABLE=2; FAN_SAVED_PWM=120
+	FAN_SAVED_POLICY=step_wise; tg_state_save
+	tg_state_clear
+	chk "fan state is empty after a clear" "$FAN_SAVED_ENABLE/$FAN_SAVED_PWM" "/"
+	tg_state_load
+	chk "saved fan state survives a reload" "$FAN_SAVED_ENABLE/$FAN_SAVED_PWM" "2/120"
+	chk "saved governor survives a reload" "$FAN_SAVED_POLICY" "step_wise"
+
+	# The policy is written back into sysfs, so only real governor names load.
+	tg_state_clear; FAN_SAVED_POLICY='user_space'; tg_state_save
+	tg_state_clear; tg_state_load
+	chk "another program's user_space is kept" "$FAN_SAVED_POLICY" "user_space"
+	tg_state_clear; FAN_SAVED_POLICY='step_wise; rm -rf /'; tg_state_save
+	tg_state_clear; tg_state_load
+	chk "a junk governor is dropped" "$FAN_SAVED_POLICY" ""
+
+	# Trip management. Only ever against a planted tree: this runs on live
+	# boards, and the real trips belong to the daemon next to it.
+	tg_selftest_tree() { # $1 root, $2 form: bpi, nofan or ro
+		local z="$1/thermal_zone0" c="$1/cooling_device0" i t
+		rm -rf "$1"; mkdir -p "$z" "$c"
+		echo pwm-fan > "$c/type"; echo 3 > "$c/max_state"; echo 0 > "$c/cur_state"
+		echo step_wise > "$z/policy"; echo 45000 > "$z/temp"
+		i=0
+		for t in critical:125000 hot:120000 active:50000 active:60000 active:70000; do
+			echo "${t%%:*}" > "$z/trip_point_${i}_type"
+			echo "${t#*:}" > "$z/trip_point_${i}_temp"
+			i=$((i + 1))
+		done
+		[ "$2" = nofan ] && return 0
+		for i in 0 1 2; do
+			ln -s ../cooling_device0 "$z/cdev$i"
+			echo $((i + 2)) > "$z/cdev${i}_trip_point"
+		done
+		[ "$2" = ro ] && chmod 0444 "$z/trip_point_3_temp"
+		return 0
+	}
+	tg_selftest_trips() { cat "$THERMAL_ROOT"/thermal_zone0/trip_point_*_temp | tr '\n' ' '; }
+	tg_selftest_trip_reset() {
+		tg_selftest_tree "$THERMAL_ROOT" "${1:-bpi}"
+		rm -f "$STATE_DIR/trip_dt"
+		TRIP_DT=""; TRIP_WIN=""; TRIP_DELTA=0; TRIP_WAS_ACTIVE=0; TRIP_TOLD=""
+		TRIP_BOOST=modem; TRIP_ACTIVE=""; TRIP_BOOST_OFFSET=15; TRIP_DT_UCI="50 60 70"
+		FAN_ZONE=""; FAN_CDEV_TYPE=pwm-fan; STAGE=-1
+	}
+	# UCI on a live board must not see the selftest's trip_dt
+	uci() { return 0; }
+	saved_root=$THERMAL_ROOT
+	THERMAL_ROOT="$dir/thermal"
+	case "$THERMAL_ROOT" in "$dir"/*) r=planted ;; *) r=live ;; esac
+	chk "trip tests run against a planted tree" "$r" "planted"
+
+	# cooling-levels as the R3 Mini carries them: 140 100 50 0, big-endian cells
+	saved_dt=$DT_ROOT; DT_ROOT="$dir/dt"
+	mkdir -p "$DT_ROOT/pwm-fan"
+	printf 'pwm-fan\000' > "$DT_ROOT/pwm-fan/compatible"
+	printf '\000\000\000\214\000\000\000\144\000\000\000\062\000\000\000\000' > "$DT_ROOT/pwm-fan/cooling-levels"
+	chk "cooling-levels are read from the device tree" "$(tg_fan_levels)" "140 100 50 0"
+	DT_ROOT=$saved_dt
+
+	# Without timeout a hung modem stops the loop, so its absence is a failure
+	command -v timeout >/dev/null 2>&1 && r=present || r=missing
+	chk "timeout is installed" "$r" "present"
+
+	MODEM_VAL=47; MODEM_SRC="at"; tg_modem_publish
+	r=$(cat "$STATE_DIR/modem-temp" 2>/dev/null)
+	case "$r" in
+		"47 "[0-9]*" at") chk "modem temperature is published" ok ok ;;
+		*) chk "modem temperature is published" "$r" "47 <time> at" ;;
+	esac
+	MODEM_VAL=""; tg_modem_publish
+	chk "a missing reading leaves the published one alone" "$(cat "$STATE_DIR/modem-temp" 2>/dev/null)" "$r"
+
+	r=""
+	for c in 50:60 50:66 50:70 50:71 40:100; do
+		r="$r$(tg_trip_delta "${c%:*}" "${c#*:}" 15) "
+	done
+	chk "delta rounds up to 5 K and stops at 40 K" "$r" "0 5000 5000 10000 40000 "
+	chk "offset 0, equal temperatures" "$(tg_trip_delta 50 50 0)" "0"
+	chk "offset 0, one degree warmer" "$(tg_trip_delta 50 51 0)" "5000"
+	chk "a negative modem reading lowers nothing" "$(tg_trip_delta 50 -5 15)" "0"
+	chk "no modem reading is no delta at all" "$(tg_trip_delta 50 '' 15)" ""
+	chk "no cpu reading is no delta at all" "$(tg_trip_delta '' 90 15)" ""
+
+	TRIP_WIN=""; r=""
+	for d in 20000 0 0 0; do tg_trip_push "$d"; r="$r$(tg_trip_window_max) "; done
+	chk "raising back needs three cool readings" "$r" "20000 20000 20000 0 "
+
+	chk "valid baseline" "$(tg_trip_valid '50 60 70' 3 120000 && echo ok)" "ok"
+	for v in '60 50 70' '50 60' '15 60 70' '50 60 96' '50 60 x' '50 60 90'; do
+		chk "baseline '$v' is rejected" "$(tg_trip_valid "$v" 3 90000 && echo ok)" ""
+	done
+	TRIP_BOOST=bogus; TRIP_BOOST_OFFSET=-1; tg_cfg_validate_trips
+	chk "unknown trip_boost falls back to off" "$TRIP_BOOST" "off"
+	chk "negative offset falls back to 15" "$TRIP_BOOST_OFFSET" "15"
+	for v in 41 x; do
+		TRIP_BOOST_OFFSET=$v; tg_cfg_validate_trips
+		chk "offset '$v' falls back to 15" "$TRIP_BOOST_OFFSET" "15"
+	done
+
+	tg_selftest_trip_reset
+	tg_trip_find
+	chk "the fan's zone and its active trips" "$TRIP_ZONE|$TRIP_IDX|$TRIP_LIMIT" \
+		"$THERMAL_ROOT/thermal_zone0|2 3 4|120000"
+	chk "lowering writes the lowest trip first" \
+		"$(tg_trip_pairs '35000 45000 55000' '50000 60000 70000')" "2:35000 3:45000 4:55000"
+	chk "raising writes the highest trip first" \
+		"$(tg_trip_pairs '50000 60000 70000' '35000 45000 55000')" "4:70000 3:60000 2:50000"
+
+	tg_selftest_trip_reset
+	tg_trip_cycle 50 80
+	chk "a hot modem lowers the trips" "$(tg_selftest_trips)" "125000 120000 35000 45000 55000 "
+	chk "hot and critical are never written" "$(tg_selftest_trips | cut -d' ' -f1-2)" "125000 120000"
+	tg_trip_cycle 50 ''; tg_trip_cycle 50 ''
+	chk "missing readings keep the trips down" "$(tg_selftest_trips)" "125000 120000 35000 45000 55000 "
+	tg_trip_cycle 50 60; tg_trip_cycle 50 60
+	chk "two cool readings are not enough" "$TRIP_DELTA" "15000"
+	tg_trip_cycle 50 60
+	chk "three are" "$(tg_selftest_trips)" "125000 120000 50000 60000 70000 "
+	tg_trip_cycle 40 100
+	chk "the delta stops at 40 K" "$(tg_selftest_trips)" "125000 120000 10000 20000 30000 "
+
+	tg_selftest_trip_reset
+	tg_trip_cycle 50 80; STAGE=1
+	tg_trip_cycle 50 60; tg_trip_cycle 50 60; tg_trip_cycle 50 60
+	chk "trips stay down while a stage is in force" "$TRIP_DELTA" "15000"
+
+	tg_selftest_trip_reset
+	TRIP_ACTIVE="45 55 65"; tg_trip_cycle 50 60
+	chk "trip_active is the baseline" "$(tg_selftest_trips)" "125000 120000 45000 55000 65000 "
+	TRIP_ACTIVE="65 55 45"; tg_trip_cycle 50 60
+	chk "a bad trip_active falls back to the device tree" "$(tg_selftest_trips)" "125000 120000 50000 60000 70000 "
+
+	tg_selftest_trip_reset
+	TRIP_ACTIVE="45 55 65"; TRIP_DT_UCI="50 60 75"; tg_trip_cycle 50 60
+	chk "a new device tree set is noticed" "$TRIP_DT_CHANGED" "1"
+	chk "and the baseline stays the operator's" "$(tg_selftest_trips)" "125000 120000 45000 55000 65000 "
+
+	tg_selftest_trip_reset nofan
+	tg_trip_cycle 50 80
+	chk "no zone drives the fan: inactive" "$TRIP_STATE|$TRIP_REASON" "inactive|no_zone"
+	chk "and nothing written" "$(tg_selftest_trips)" "125000 120000 50000 60000 70000 "
+	if [ "$(id -u)" = 0 ]; then
+		echo "skip a read-only trip file (root can write it anyway)"
+	else
+		tg_selftest_trip_reset ro
+		tg_trip_cycle 50 80
+		chk "a trip that cannot be written: inactive" "$TRIP_STATE|$TRIP_REASON" "inactive|not_writable"
+	fi
+
+	tg_selftest_trip_reset
+	tg_trip_find
+	echo hot > "$THERMAL_ROOT/thermal_zone0/trip_point_3_type"
+	tg_trip_write "35000 45000 55000" && r=ok || r=failed
+	chk "a trip that turned into hot is not written" "$r|$(tg_selftest_trips)" \
+		"failed|125000 120000 35000 60000 55000 "
+
+	tg_selftest_trip_reset
+	TRIP_BOOST=off; before=$(tg_selftest_trips)
+	tg_trip_cycle 50 90; tg_trip_cycle 50 90
+	chk "switched off, nothing is written" "$TRIP_STATE|$(tg_selftest_trips)" "off|$before"
+
+	tg_selftest_trip_reset
+	tg_trip_cycle 50 80
+	TRIP_BOOST=off; tg_trip_cycle 50 80
+	chk "switching off hands back the device tree set" "$(tg_selftest_trips)" "125000 120000 50000 60000 70000 "
+	echo 44000 > "$THERMAL_ROOT/thermal_zone0/trip_point_2_temp"
+	tg_trip_cycle 50 80
+	chk "and after that leaves the zone alone" "$(tg_selftest_trips)" "125000 120000 44000 60000 70000 "
+	THERMAL_ROOT=$saved_root; STAGE=-1; TRIP_BOOST=off
+	unset -f uci
+
+	# Stage actions are checked by reading the result back, not by trusting the
+	# command. Everything that would reach the modem or netifd is replaced by a
+	# stand-in, so this runs safely on a live board. Kept last: the stand-ins
+	# stay defined for the rest of the run.
+	CFUN_SETTLE=0; SELFTEST_CFUN=1; SELFTEST_CFUN_STICKS=1
+	tg_modem_port() { echo /dev/selftest; }
+	tg_at() {
+		case "$2" in
+			'AT+CFUN?') echo "+CFUN: $SELFTEST_CFUN"; echo OK ;;
+			AT+CFUN=*) [ "$SELFTEST_CFUN_STICKS" = 1 ] && SELFTEST_CFUN=${2#AT+CFUN=}; echo OK ;;
+		esac
+	}
+	: > "$EVLOG"
+	MODEM_RADIO_OFF_AT='AT+CFUN=4'
+	tg_run_action modem_radio_off && r=ok || r=failed
+	chk "radio off is confirmed by reading CFUN back" "$r/$SELFTEST_CFUN" "ok/4"
+	MODEM_RADIO_OFF_AT='AT+CFUN=0'
+	tg_run_action modem_radio_off && r=ok || r=failed
+	chk "the configured off level is the one sent" "$r/$SELFTEST_CFUN" "ok/0"
+	SELFTEST_CFUN_STICKS=0; SELFTEST_CFUN=1
+	tg_run_action modem_radio_off && r=ok || r=failed
+	chk "a modem that stays on fails the action" "$r" "failed"
+	chk "and says what it reported" "$(grep -c 'modem reports CFUN 1 after AT+CFUN=0' "$EVLOG")" "1"
+	SELFTEST_CFUN_STICKS=1; SELFTEST_CFUN=4
+	tg_action_modem_radio_on && r=ok || r=failed
+	chk "switching back on is confirmed as well" "$r/$SELFTEST_CFUN" "ok/1"
+
+	SELFTEST_IFACE_UP=true; SELFTEST_IFACE_STICKS=1
+	ubus() {
+		case "$2" in
+			network.interface.wwan) printf '{\n\t"up": %s,\n\t"l3_device": "wwan0"\n}\n' "$SELFTEST_IFACE_UP" ;;
+		esac
+	}
+	ifdown() { [ "$SELFTEST_IFACE_STICKS" = 1 ] && SELFTEST_IFACE_UP=false; return 0; }
+	ifup() { SELFTEST_IFACE_UP=true; return 0; }
+	UPLINK_INTERFACE=wwan; ACTION_INTERFACE=""
+	tg_run_action interface_down && r=ok || r=failed
+	chk "interface_down defaults to the uplink interface" "$r/$SELFTEST_IFACE_UP" "ok/false"
+	SELFTEST_IFACE_UP=true; SELFTEST_IFACE_STICKS=0
+	tg_run_action interface_down && r=ok || r=failed
+	chk "an interface that stays up fails the action" "$r" "failed"
+	UPLINK_INTERFACE=""; ACTION_INTERFACE=lan2
+	tg_run_action interface_down && r=ok || r=failed
+	chk "an interface netifd does not know fails the action" "$r" "failed"
+	UPLINK_INTERFACE=""; ACTION_INTERFACE=""
+	tg_run_action interface_down && r=ok || r=failed
+	chk "interface_down without any interface fails" "$r" "failed"
+
+	# Names reach ifdown and a ubus path, so only UCI section names pass.
+	chk_iface() { # $1 label, $2 value, $3 accept or reject
+		if tg_iface_name_ok "$2"; then chk "$1" accept "$3"; else chk "$1" reject "$3"; fi
+	}
+	chk_iface "an interface name" wwan accept
+	chk_iface "an interface name with an underscore" wwan_6 accept
+	chk_iface "an option in disguise" '-a' reject
+	chk_iface "a ubus path in disguise" 'wwan.x' reject
+	chk_iface "an empty interface name" '' reject
+
+	MODEM_RADIO_OFF_AT='AT+QPOWD=1'; ACTION_INTERFACE='-a'; UPLINK_INTERFACE='wwan'
+	tg_cfg_validate_actions
+	chk "any AT command but CFUN=4 or 0 is refused" "$MODEM_RADIO_OFF_AT" "AT+CFUN=4"
+	chk "a bad action_interface is dropped" "$ACTION_INTERFACE" ""
+	chk "a good uplink_interface is kept" "$UPLINK_INTERFACE" "wwan"
+
+	rm -rf "$dir"
+	[ "$fail" = 0 ] && echo "selftest: all cases passed" || echo "selftest: FAILED"
+	return $fail
+}
+
+case "${1:-}" in
+	-V|--version) echo "thermal-guard $THERMAL_GUARD_VERSION" ;;
+	selftest) tg_selftest ;;
+	daemon) tg_daemon ;;
+	status) tg_status ;;
+	reset) tg_reset ;;
+	test) tg_test "${2:-}" "${3:-}" ;;
+	*) echo "usage: thermal-guard daemon|status|reset|test <cpu> <modem>|selftest|-V" >&2; exit 2 ;;
+esac

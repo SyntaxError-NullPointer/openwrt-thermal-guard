@@ -1,0 +1,24 @@
+{
+	"luci-app-thermal-guard": {
+		"description": "Read the thermal-guard status, edit its configuration and clear stages",
+		"read": {
+			"file": {
+				"/var/run/thermal-guard.status": [ "read" ],
+				"/tmp/run/thermal-guard.status": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "read" ]
+			},
+			"uci": [ "thermal-guard" ]
+		},
+		"write": {
+			"file": {
+				"/usr/sbin/thermal-guard reset": [ "exec" ]
+			},
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"uci": [ "thermal-guard" ]
+		}
+	}
+}

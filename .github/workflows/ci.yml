@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu ships 0.9.0, which does not know the busybox dialect
+      - name: Install shellcheck
+        env:
+          SC_VERSION: v0.11.0
+          SC_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          curl -fsSL -o /tmp/shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SC_VERSION}/shellcheck-${SC_VERSION}.linux.x86_64.tar.xz"
+          echo "${SC_SHA256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/shellcheck-${SC_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+      - name: Lint shell sources
+        run: |
+          shellcheck -s busybox \
+            thermal-guard/files/usr/sbin/thermal-guard \
+            thermal-guard/files/usr/share/thermal-guard/backends.sh \
+            thermal-guard/files/usr/share/thermal-guard/trips.sh \
+            thermal-guard/files/usr/libexec/thermal-guard-collectd \
+            tests/run-selftest.sh \
+            tests/run-integration.sh
+          # rc.common consumes START/STOP/USE_PROCD and shellcheck cannot follow the source
+          shellcheck -s busybox -e SC1091,SC2034 thermal-guard/files/etc/init.d/thermal-guard
+
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install busybox
+        run: sudo apt-get update && sudo apt-get install -y busybox
+      - name: Run the decision logic selftest
+        run: sh tests/run-selftest.sh
+      - name: Run the state and reset integration tests
+        run: sh tests/run-integration.sh
+      # The target runs busybox ash, and it differs from dash in ways that
+      # matter: a redefined function that gets unset takes the original with
+      # it, which went unnoticed until the suites were run under it.
+      - name: Run both suites under busybox ash
+        run: |
+          busybox sh tests/run-selftest.sh
+          busybox sh tests/run-integration.sh
+
+  luci-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Check the views for syntax errors
+        run: |
+          node --check luci-app-thermal-guard/htdocs/luci-static/resources/view/thermal-guard/config.js
+          node --check luci-app-thermal-guard/htdocs/luci-static/resources/view/thermal-guard/monitor.js
+          node --check luci-app-thermal-guard/htdocs/luci-static/resources/view/status/include/11_thermal-guard.js
+
+  json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate menu and acl files
+        run: |
+          for f in luci-app-thermal-guard/root/usr/share/luci/menu.d/*.json \
+                   luci-app-thermal-guard/root/usr/share/rpcd/acl.d/*.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done
