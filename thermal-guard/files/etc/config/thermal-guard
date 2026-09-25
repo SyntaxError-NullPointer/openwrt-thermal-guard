@@ -24,9 +24,12 @@ config thermal-guard 'main'
 	# none leaves the fan to whatever regulates it already. auto takes the cooling
 	# device if there is one and otherwise stays off the fan; it never picks pwm.
 	option fan_mode 'none'
-	# cooling_device mode, empty means autodetect by type
+	# type of the fan's cooling device, for cooling_device, auto and trip
+	# management; empty means pwm-fan
 	option fan_cooling_device_type 'pwm-fan'
-	# governor the zone is handed back to on reset
+	# governor the zone is handed back to on reset when none was recorded
+	# before: step_wise, fair_share, bang_bang or power_allocator. Not
+	# user_space, nothing would regulate then.
 	option fan_governor 'step_wise'
 	# pwm mode. Leave the paths empty to look the fan chip up by hwmon name.
 	#option pwm_path '/sys/class/hwmon/hwmon2/pwm1'

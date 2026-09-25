@@ -23,7 +23,7 @@ function tripReasonText(code) {
 	switch (code) {
 		case 'no_cdev':        return _('the kernel knows no fan on this device');
 		case 'no_zone':        return _('no thermal zone drives the fan');
-		case 'zone_path':      return _('the configured thermal zone is not under /sys/class/thermal');
+		case 'zone_path':      return _('the fan\'s thermal zone is not under /sys/class/thermal');
 		case 'no_active_trip': return _('the fan is not bound to any switching temperature');
 		case 'not_writable':   return _('the switching temperatures cannot be changed');
 		default:               return code || _('unknown reason');
@@ -34,20 +34,36 @@ function tripList(v) {
 	return (v || '').split('/').filter(function(x) { return x !== ''; });
 }
 
+// The daemon's defaults, from tg_cfg_default_thresholds. An empty field means
+// the daemon uses these, so the order is checked against them as well.
+var THRESHOLD_DEFAULTS = {
+	cpu_warn: 70, cpu_crit: 80, cpu_emergency: 90, modem_warn: 80, modem_crit: 88
+};
+
+// The value the daemon will use: the default when empty, NaN when it is not
+// a whole number.
+function thresholdValue(option, value) {
+	if (value == null || value === '')
+		return THRESHOLD_DEFAULTS[option];
+	return /^[0-9]+$/.test(value) ? parseInt(value, 10) : NaN;
+}
+
 // Thresholds have to stay ordered, otherwise the service falls back to its
-// defaults and the protection silently stops doing what the form says.
-function checkOrder(section_id, value, below, above, belowLabel, aboveLabel) {
-	var v = parseInt(value, 10);
+// defaults and the protection silently stops doing what the form says. The
+// neighbours are read from the form, not from the saved configuration, so a
+// change made next to this one counts.
+function checkOrder(section, section_id, option, value, below, above, belowLabel, aboveLabel) {
+	var v = thresholdValue(option, value);
 	if (isNaN(v))
 		return _('Enter a whole number');
 
 	if (below) {
-		var b = parseInt(uci.get('thermal-guard', section_id, below), 10);
+		var b = thresholdValue(below, section.formvalue(section_id, below));
 		if (!isNaN(b) && v <= b)
 			return _('Must be above %s (%d)').format(belowLabel, b);
 	}
 	if (above) {
-		var a = parseInt(uci.get('thermal-guard', section_id, above), 10);
+		var a = thresholdValue(above, section.formvalue(section_id, above));
 		if (!isNaN(a) && v >= a)
 			return _('Must be below %s (%d)').format(aboveLabel, a);
 	}
@@ -99,7 +115,7 @@ return view.extend({
 
 		o = s.taboption('general', form.Value, 'interval', _('Interval'),
 			_('Seconds between two temperature readings. Values below five seconds are treated as five.'));
-		o.datatype = 'min(5)';
+		o.datatype = 'and(uinteger,min(5))';
 		o.placeholder = '20';
 
 		o = s.taboption('general', form.Value, 'cpu_temp_path', _('Processor temperature source'),
@@ -113,26 +129,36 @@ return view.extend({
 		o = s.taboption('thresholds', form.Value, 'cpu_warn', _('Processor warning (stage 1 of 3)'),
 			_('Stage 1 of 3 starts when either temperature reaches its warning level: a warning, and full fan speed if this service drives the fan.'));
 		o.placeholder = '70';
-		o.validate = function(id, v) { return checkOrder(id, v, null, 'cpu_crit', null, _('Processor critical')); };
+		o.validate = function(id, v) {
+			return checkOrder(this.section, id, 'cpu_warn', v, null, 'cpu_crit', null, _('Processor critical'));
+		};
 
 		o = s.taboption('thresholds', form.Value, 'cpu_crit', _('Processor critical (stage 2 of 3)'));
 		o.placeholder = '80';
-		o.validate = function(id, v) { return checkOrder(id, v, 'cpu_warn', 'cpu_emergency', _('Processor warning'), _('Processor emergency')); };
+		o.validate = function(id, v) {
+			return checkOrder(this.section, id, 'cpu_crit', v, 'cpu_warn', 'cpu_emergency', _('Processor warning'), _('Processor emergency'));
+		};
 
 		o = s.taboption('thresholds', form.Value, 'cpu_emergency', _('Processor emergency (stage 3 of 3)'));
 		o.placeholder = '90';
-		o.validate = function(id, v) { return checkOrder(id, v, 'cpu_crit', null, _('Processor critical'), null); };
+		o.validate = function(id, v) {
+			return checkOrder(this.section, id, 'cpu_emergency', v, 'cpu_crit', null, _('Processor critical'), null);
+		};
 
 		o = s.taboption('thresholds', form.Value, 'modem_warn', _('Modem warning (stage 1 of 3)'));
 		o.placeholder = '80';
-		o.validate = function(id, v) { return checkOrder(id, v, null, 'modem_crit', null, _('Modem critical')); };
+		o.validate = function(id, v) {
+			return checkOrder(this.section, id, 'modem_warn', v, null, 'modem_crit', null, _('Modem critical'));
+		};
 
 		o = s.taboption('thresholds', form.Value, 'modem_crit', _('Modem critical (stage 2 of 3)'));
 		o.placeholder = '88';
-		o.validate = function(id, v) { return checkOrder(id, v, 'modem_warn', null, _('Modem warning'), null); };
+		o.validate = function(id, v) {
+			return checkOrder(this.section, id, 'modem_crit', v, 'modem_warn', null, _('Modem warning'), null);
+		};
 
 		o = s.taboption('thresholds', form.Value, 'hold_minutes', _('Hold time'),
-			_('Minutes a stage has to last before the next stage starts, even if the temperature does not rise any further.'));
+			_('Minutes a stage has to last before the next one starts on time alone: stage 2 of 3 if the temperature has not dropped, stage 3 of 3 if it is still rising.'));
 		o.datatype = 'uinteger';
 		o.placeholder = '3';
 
@@ -156,9 +182,14 @@ return view.extend({
 		o.depends('fan_mode', 'auto');
 		o.depends('fan_mode', 'cooling_device');
 
-		o = s.taboption('fan', form.Value, 'fan_governor', _('Control mode to restore'),
-			_('Control mode handed back to the kernel when the stages are cleared. The default fits almost every device.'));
-		o.placeholder = 'step_wise';
+		o = s.taboption('fan', form.ListValue, 'fan_governor', _('Control mode to restore'),
+			_('Control mode handed back to the kernel when the stages are cleared and no earlier control mode was recorded. The default fits almost every device.'));
+		// The daemon's list, kernel names and not translated. Not user_space:
+		// nothing would regulate the fan after a reset.
+		[ 'step_wise', 'fair_share', 'bang_bang', 'power_allocator' ].forEach(function(g) {
+			o.value(g);
+		});
+		o.default = 'step_wise';
 		o.depends('fan_mode', 'auto');
 		o.depends('fan_mode', 'cooling_device');
 
@@ -242,23 +273,39 @@ return view.extend({
 				return _('The installed firmware now uses %s °C. Your own base values were set for an earlier firmware and still apply.').format(tripDt.join(', '));
 			};
 
-			// Parse the form first, then set the values, otherwise the form
-			// writes the old list back over them.
-			var saveTrips = function(adopt) {
-				return m.save(function() {
-					uci.set('thermal-guard', 'main', 'trip_dt', tripDt);
-					if (adopt)
-						uci.set('thermal-guard', 'main', 'trip_active', tripDt);
-				}).then(function() { return ui.changes.apply(true); });
+			// The daemon keeps the firmware values trip_active was made for in
+			// a file of its own; trips-keep records the ones of this boot.
+			// Resolves to true when that worked.
+			var keepTrips = function() {
+				var failed = function(why) {
+					ui.addNotification(null, E('p', {}, _('Recording the firmware values failed: %s').format(why)), 'error');
+					return false;
+				};
+				return fs.exec('/usr/sbin/thermal-guard', [ 'trips-keep' ]).then(function(res) {
+					if (res.code !== 0)
+						return failed(res.stderr || res.stdout || res.code);
+					ui.addNotification(null, E('p', {}, _('Firmware values recorded. The notice goes away with the next check.')), 'info');
+					return true;
+				}).catch(failed);
 			};
 
 			o = s.taboption('fan', form.Button, '_trip_dt_adopt', ' ');
 			o.inputtitle = _('Use the firmware values');
-			o.onclick = function() { return saveTrips(true); };
+			// Parse the form first, then set the values, otherwise the form
+			// writes the old list back over them. Apply reloads the page, so
+			// it comes last.
+			o.onclick = function() {
+				return m.save(function() {
+					uci.set('thermal-guard', 'main', 'trip_active', tripDt);
+				}).then(keepTrips).then(function(ok) {
+					if (ok)
+						return ui.changes.apply(true);
+				});
+			};
 
 			o = s.taboption('fan', form.Button, '_trip_dt_keep', ' ');
 			o.inputtitle = _('Keep my values');
-			o.onclick = function() { return saveTrips(false); };
+			o.onclick = keepTrips;
 		}
 
 		if (st.fan_levels) {
@@ -376,7 +423,7 @@ return view.extend({
 		};
 
 		o = s.taboption('actions', form.Value, 'uplink_interface', _('Modem network interface'),
-			_('Lets the service check whether another internet connection exists before it switches the modem off.'));
+			_('Lets the service tell whether another internet connection exists, so a message from stage 2 of 3 on goes out or waits in the queue. Also the interface the interface action takes when none is set.'));
 		o.datatype = 'uciname';
 
 		return m.render();

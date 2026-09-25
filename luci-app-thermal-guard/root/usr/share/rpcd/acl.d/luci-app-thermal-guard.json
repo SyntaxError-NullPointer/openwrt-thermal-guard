@@ -1,6 +1,6 @@
 {
 	"luci-app-thermal-guard": {
-		"description": "Read the thermal-guard status, edit its configuration and clear stages",
+		"description": "Read the thermal-guard status, edit its configuration, clear stages and record firmware trips",
 		"read": {
 			"file": {
 				"/var/run/thermal-guard.status": [ "read" ],
@@ -13,7 +13,8 @@
 		},
 		"write": {
 			"file": {
-				"/usr/sbin/thermal-guard reset": [ "exec" ]
+				"/usr/sbin/thermal-guard reset": [ "exec" ],
+				"/usr/sbin/thermal-guard trips-keep": [ "exec" ]
 			},
 			"ubus": {
 				"file": [ "exec" ]

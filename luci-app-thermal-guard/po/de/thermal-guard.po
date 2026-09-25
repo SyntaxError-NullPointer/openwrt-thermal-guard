@@ -106,8 +106,8 @@ msgstr "Modem Warnung"
 msgid "Hold time"
 msgstr "Haltezeit"
 
-msgid "Minutes a stage has to last before the next stage starts, even if the temperature does not rise any further."
-msgstr "Minuten, die eine Stufe andauern muss, bevor die nächste einsetzt, auch wenn die Temperatur nicht weiter steigt."
+msgid "Minutes a stage has to last before the next one starts on time alone: stage 2 of 3 if the temperature has not dropped, stage 3 of 3 if it is still rising."
+msgstr "Minuten, die eine Stufe andauern muss, bevor allein nach Zeit die nächste einsetzt: Stufe 2 von 3, wenn die Temperatur nicht gesunken ist, Stufe 3 von 3, wenn sie weiter steigt."
 
 msgid "Hysteresis"
 msgstr "Hysterese"
@@ -142,8 +142,8 @@ msgstr "Name, unter dem der Kernel den Lüfter führt. Nur ändern, wenn der Lü
 msgid "Control mode to restore"
 msgstr "Wiederherzustellendes Regelverfahren"
 
-msgid "Control mode handed back to the kernel when the stages are cleared. The default fits almost every device."
-msgstr "Regelverfahren, das beim Zurücksetzen der Schutzstufen wieder an den Kernel übergeben wird. Die Vorgabe passt für nahezu alle Geräte."
+msgid "Control mode handed back to the kernel when the stages are cleared and no earlier control mode was recorded. The default fits almost every device."
+msgstr "Regelverfahren, das beim Zurücksetzen der Schutzstufen an den Kernel übergeben wird, wenn kein früheres festgehalten wurde. Die Vorgabe passt für nahezu alle Geräte."
 
 msgid "Fan speed file"
 msgstr "Datei für die Lüfterdrehzahl"
@@ -283,8 +283,8 @@ msgstr "Muss druckbarer Text ohne Anführungszeichen und Backslashes sein"
 msgid "Modem network interface"
 msgstr "Netzwerkschnittstelle des Modems"
 
-msgid "Lets the service check whether another internet connection exists before it switches the modem off."
-msgstr "Damit prüft der Dienst vor dem Abschalten des Modems, ob eine andere Internetverbindung besteht."
+msgid "Lets the service tell whether another internet connection exists, so a message from stage 2 of 3 on goes out or waits in the queue. Also the interface the interface action takes when none is set."
+msgstr "Damit erkennt der Dienst, ob eine andere Internetverbindung besteht, und entscheidet ab Stufe 2 von 3, ob eine Nachricht sofort hinausgeht oder in der Warteschlange wartet. Außerdem die Netzwerkschnittstelle, die die Schnittstellen-Aktion verwendet, wenn keine eingestellt ist."
 
 msgid "Wi-Fi %d"
 msgstr "WLAN %d"
@@ -361,8 +361,8 @@ msgstr "Der Lüfter wird von einem anderen Dienst gesteuert"
 msgid "This device does not report any temperature"
 msgstr "Dieses Gerät meldet keine Temperatur"
 
-msgid "No thermal sensor was found, so there is nothing to watch on this hardware. The service stays idle and takes no action."
-msgstr "Es wurde kein Temperatursensor gefunden. Auf dieser Hardware gibt es nichts zu überwachen. Der Dienst bleibt untätig und greift nicht ein."
+msgid "No thermal sensor was found, so the processor is not watched on this hardware. The modem thresholds still apply while the modem reports a temperature."
+msgstr "Es wurde kein Temperatursensor gefunden, der Prozessor wird auf dieser Hardware daher nicht überwacht. Die Modemschwellen gelten weiter, solange das Modem eine Temperatur meldet."
 
 msgid "The service is not running. Protection stages stay applied and the fan is not handed back."
 msgstr "Der Dienst läuft nicht. Aktive Schutzstufen bleiben bestehen und der Lüfter wird nicht freigegeben."
@@ -424,8 +424,8 @@ msgstr "der Kernel kennt auf diesem Gerät keinen Lüfter"
 msgid "no thermal zone drives the fan"
 msgstr "keine Thermalzone steuert den Lüfter"
 
-msgid "the configured thermal zone is not under /sys/class/thermal"
-msgstr "die eingestellte Thermalzone liegt nicht unter /sys/class/thermal"
+msgid "the fan's thermal zone is not under /sys/class/thermal"
+msgstr "die Thermalzone des Lüfters liegt nicht unter /sys/class/thermal"
 
 msgid "the fan is not bound to any switching temperature"
 msgstr "der Lüfter ist an keine Schalttemperatur gebunden"
@@ -492,6 +492,12 @@ msgstr "Werte der Firmware übernehmen"
 
 msgid "Keep my values"
 msgstr "Eigene Werte behalten"
+
+msgid "Recording the firmware values failed: %s"
+msgstr "Die Firmware-Werte konnten nicht festgehalten werden: %s"
+
+msgid "Firmware values recorded. The notice goes away with the next check."
+msgstr "Firmware-Werte festgehalten. Der Hinweis verschwindet mit der nächsten Prüfung."
 
 msgid "Fan steps of the firmware"
 msgstr "Lüfterstufen der Firmware"

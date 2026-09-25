@@ -21,7 +21,11 @@ TRIP_DELTA_MAX=40000
 # Runtime state, rebuilt from sysfs by every daemon start.
 TRIP_STATE=off; TRIP_REASON=""; TRIP_ZONE=""; TRIP_IDX=""; TRIP_LIMIT=""
 TRIP_BASE=""; TRIP_DT=""; TRIP_NOW=""; TRIP_WIN=""; TRIP_DELTA=0
-TRIP_WAS_ACTIVE=0; TRIP_DT_CHANGED=0; TRIP_TOLD=""
+TRIP_WAS_ACTIVE=0; TRIP_DT_CHANGED=0
+# What was last said per message, each cleared when its cause is gone.
+TRIP_TOLD_FIND=""; TRIP_TOLD_VALID=""; TRIP_TOLD_DT=""; TRIP_TOLD_WRITE=""
+# Set once a failed write of trip_base has been reported, until one succeeds.
+TRIP_BASE_TOLD=0
 
 # $1 cpu, $2 modem, $3 offset, all whole degrees. Prints the delta in
 # millidegrees, or nothing when a reading is missing: no reading is not the same
@@ -76,7 +80,7 @@ tg_trip_valid() {
 # by temperature. Sets TRIP_ZONE, TRIP_IDX, TRIP_LIMIT or TRIP_REASON, a fixed
 # code the web interface translates.
 tg_trip_find() {
-	local cdev z c idx t list="" lim=""
+	local cdev z c idx t lim=""
 	TRIP_ZONE=""; TRIP_IDX=""; TRIP_LIMIT=""
 	cdev=$(tg_fan_find_cdev)
 	[ -n "$cdev" ] || { TRIP_REASON=no_cdev; return 1; }
@@ -86,20 +90,22 @@ tg_trip_find() {
 	[ -n "$z" ] || { TRIP_REASON=no_zone; return 1; }
 	tg_path_thermal "$z" || { TRIP_REASON=zone_path; return 1; }
 
-	for c in "$z"/cdev*; do
-		case "${c##*/}" in cdev*[!0-9]*) continue ;; esac
-		[ "$(readlink -f "$c")" = "$(readlink -f "$cdev")" ] || continue
-		idx=$(tg_int "$(cat "${c}_trip_point" 2>/dev/null)")
-		[ -n "$idx" ] || continue
-		[ "$(cat "$z/trip_point_${idx}_type" 2>/dev/null)" = active ] || continue
-		t=$(tg_int "$(cat "$z/trip_point_${idx}_temp" 2>/dev/null)")
-		[ -n "$t" ] || continue
-		list="$list$t $idx
-"
-	done
-	[ -n "$list" ] || { TRIP_REASON=no_active_trip; return 1; }
-	TRIP_IDX=$(printf '%s' "$list" | sort -n | uniq | while read -r t idx; do printf '%s ' "$idx"; done)
+	# One "temp index" line per active trip bound to the fan, ordered by
+	# temperature. This runs in a subshell, so nothing in it sets a global.
+	TRIP_IDX=$(
+		for c in "$z"/cdev*; do
+			case "${c##*/}" in cdev*[!0-9]*) continue ;; esac
+			[ "$(readlink -f "$c")" = "$(readlink -f "$cdev")" ] || continue
+			idx=$(tg_int "$(cat "${c}_trip_point" 2>/dev/null)")
+			[ -n "$idx" ] || continue
+			[ "$(cat "$z/trip_point_${idx}_type" 2>/dev/null)" = active ] || continue
+			t=$(tg_int "$(cat "$z/trip_point_${idx}_temp" 2>/dev/null)")
+			[ -n "$t" ] || continue
+			printf '%s %s\n' "$t" "$idx"
+		done | sort -n | uniq | while read -r t idx; do printf '%s ' "$idx"; done
+	)
 	TRIP_IDX=${TRIP_IDX% }
+	[ -n "$TRIP_IDX" ] || { TRIP_REASON=no_active_trip; return 1; }
 
 	for idx in $TRIP_IDX; do
 		[ -w "$z/trip_point_${idx}_temp" ] || { TRIP_REASON=not_writable; return 1; }
@@ -136,17 +142,17 @@ tg_trip_write() {
 	for p in $(tg_trip_pairs "$want" "$now"); do
 		idx=${p%%:*}; w=${p#*:}
 		[ "$(cat "$TRIP_ZONE/trip_point_${idx}_type" 2>/dev/null)" = active ] || {
-			tg_log "trip $idx is no longer active, not writing it"; fail=1; continue; }
+			tg_log "trip $idx is no longer active, not writing it" warning; fail=1; continue; }
 		echo "$w" > "$TRIP_ZONE/trip_point_${idx}_temp" 2>/dev/null
 		got=$(tg_int "$(cat "$TRIP_ZONE/trip_point_${idx}_temp" 2>/dev/null)")
 		[ "$got" = "$w" ] || fail=1
 	done
 	TRIP_NOW=$(tg_trip_read)
 	if [ "$fail" = 1 ]; then
-		tg_trip_tell "write" "could not set trips to $(tg_trip_deg "$want") C, they read $(tg_trip_deg "$TRIP_NOW") C"
+		tg_trip_tell "write" "could not set trips to $(tg_trip_deg "$want") C, they read $(tg_trip_deg "$TRIP_NOW") C" warning
 		return 1
 	fi
-	TRIP_TOLD=""
+	TRIP_TOLD_WRITE=""
 	tg_log "trips set to $(tg_trip_deg "$want") C (delta $((TRIP_DELTA / 1000)) K)"
 }
 
@@ -187,15 +193,28 @@ tg_trip_deg() { # millidegree list to whole degrees, for the log
 }
 
 # Say a thing once until it changes, the daemon runs every interval.
-tg_trip_tell() { # $1 key, $2 text
-	[ "$TRIP_TOLD" = "$1:$2" ] && return 0
-	TRIP_TOLD="$1:$2"
-	tg_cfg_log "$2"
+tg_trip_tell() { # $1 find, valid, dt or write, $2 text, $3 priority as for tg_cfg_log
+	local told
+	case "$1" in
+		find) told=$TRIP_TOLD_FIND ;;
+		valid) told=$TRIP_TOLD_VALID ;;
+		dt) told=$TRIP_TOLD_DT ;;
+		write) told=$TRIP_TOLD_WRITE ;;
+		*) return 0 ;;
+	esac
+	[ "$told" = "$2" ] && return 0
+	case "$1" in
+		find) TRIP_TOLD_FIND=$2 ;;
+		valid) TRIP_TOLD_VALID=$2 ;;
+		dt) TRIP_TOLD_DT=$2 ;;
+		write) TRIP_TOLD_WRITE=$2 ;;
+	esac
+	tg_cfg_log "$2" "${3:-warning}"
 }
 
 # Device tree values of this boot: read once per boot, before anything wrote.
 tg_trip_dt_load() {
-	local f="$STATE_DIR/trip_dt" v
+	local f="$STATE_DIR/trip_dt"
 	if [ -r "$f" ]; then
 		TRIP_DT=$(cat "$f")
 	else
@@ -203,14 +222,50 @@ tg_trip_dt_load() {
 		mkdir -p "$STATE_DIR"
 		echo "$TRIP_DT" > "$f"
 	fi
-	[ "$DRY" = 1 ] && return 0
-	[ -n "$TRIP_DT_UCI" ] && return 0
-	command -v uci >/dev/null 2>&1 || return 0
-	# Remember which device tree set the operator's baseline was made for
-	TRIP_DT_UCI=$(tg_trip_deg "$TRIP_DT" | tr '/' ' ')
-	uci -q delete thermal-guard.main.trip_dt
-	for v in $TRIP_DT_UCI; do uci -q add_list thermal-guard.main.trip_dt="$v"; done
-	uci -q commit thermal-guard
+}
+
+# trip_base holds the device tree set, in whole degrees, that the operator's
+# trip_active was made for. It lives on the overlay because a sysupgrade is
+# exactly when the device tree changes. Without trip_active it means nothing,
+# so it is neither read nor written then.
+tg_trip_base_save() { # $1 whole degrees, space separated
+	local f="$PERSIST_DIR/trip_base"
+	mkdir -p "$PERSIST_DIR" 2>/dev/null &&
+		echo "$1" > "$f.tmp" 2>/dev/null && chmod 644 "$f.tmp" &&
+		mv "$f.tmp" "$f" 2>/dev/null || return 1
+	sync
+}
+
+tg_trip_base_read() {
+	local v
+	v=$(cat "$PERSIST_DIR/trip_base" 2>/dev/null)
+	case "$v" in
+		*[!0-9\ ]*) echo "" ;;
+		*) echo "$v" ;;
+	esac
+}
+
+# Sets TRIP_DT_CHANGED when the device tree set of this boot is not the one
+# trip_base names. The first cycle with trip_active records it.
+tg_trip_base_check() {
+	local now base msg
+	now=$(tg_trip_deg "$TRIP_DT" | tr '/' ' ')
+	if [ ! -e "$PERSIST_DIR/trip_base" ]; then
+		[ "$DRY" = 1 ] && return 0
+		if tg_trip_base_save "$now"; then
+			TRIP_BASE_TOLD=0
+			return 0
+		fi
+		[ "$TRIP_BASE_TOLD" = 1 ] && return 0
+		tg_cfg_log "could not write $PERSIST_DIR/trip_base, a new firmware will not be noticed"
+		[ "$DAEMON" = 1 ] && TRIP_BASE_TOLD=1
+		return 0
+	fi
+	base=$(tg_trip_base_read)
+	[ -n "$base" ] && [ "$base" != "$now" ] || return 0
+	TRIP_DT_CHANGED=1
+	msg="device tree trips are now $(tg_trip_deg "$TRIP_DT") C,"
+	tg_trip_tell dt "$msg trip_active was set for $(echo "$base" | tr ' ' '/') C" notice
 }
 
 # One cycle. $1 cpu, $2 modem in whole degrees.
@@ -218,6 +273,7 @@ tg_trip_cycle() {
 	local cpu="$1" modem="$2" d want="" b
 	if [ "$TRIP_BOOST" = off ] && [ -z "$TRIP_ACTIVE" ]; then
 		TRIP_STATE=off; TRIP_REASON=""
+		TRIP_TOLD_FIND=""; TRIP_TOLD_VALID=""; TRIP_TOLD_DT=""
 		# Switched off while running: hand the zone back its device tree set
 		# once, then leave it alone for good.
 		if [ "$TRIP_WAS_ACTIVE" = 1 ] && [ -n "$TRIP_ZONE" ] && [ -n "$TRIP_DT" ]; then
@@ -233,6 +289,7 @@ tg_trip_cycle() {
 		tg_trip_tell find "trip management inactive ($TRIP_REASON), zone ${TRIP_ZONE:-none}"
 		return 0
 	fi
+	TRIP_TOLD_FIND=""
 	[ -n "$TRIP_DT" ] || tg_trip_dt_load
 	TRIP_NOW=$(tg_trip_read)
 
@@ -241,17 +298,19 @@ tg_trip_cycle() {
 		tg_trip_valid "$TRIP_ACTIVE" "$(tg_trip_count "$TRIP_IDX")" "$TRIP_LIMIT"; then
 		TRIP_BASE=""
 		for b in $TRIP_ACTIVE; do TRIP_BASE="$TRIP_BASE${TRIP_BASE:+ }$((b * 1000))"; done
+		TRIP_TOLD_VALID=""
 	else
-		[ -n "$TRIP_ACTIVE" ] && tg_trip_tell valid "rejecting trip_active '$TRIP_ACTIVE', using the device tree values"
+		if [ -n "$TRIP_ACTIVE" ]; then
+			tg_trip_tell valid "rejecting trip_active '$TRIP_ACTIVE', using the device tree values"
+		else
+			TRIP_TOLD_VALID=""
+		fi
 		TRIP_BASE=$TRIP_DT
 	fi
 
 	TRIP_DT_CHANGED=0
-	if [ -n "$TRIP_ACTIVE" ] && [ -n "$TRIP_DT_UCI" ] &&
-		[ "$(tg_trip_deg "$TRIP_DT" | tr '/' ' ')" != "$TRIP_DT_UCI" ]; then
-		TRIP_DT_CHANGED=1
-		tg_trip_tell dt "device tree trips are now $(tg_trip_deg "$TRIP_DT") C, trip_active was set for $(echo "$TRIP_DT_UCI" | tr ' ' '/') C"
-	fi
+	[ -n "$TRIP_ACTIVE" ] && tg_trip_base_check
+	[ "$TRIP_DT_CHANGED" = 1 ] || TRIP_TOLD_DT=""
 
 	if [ "$TRIP_BOOST" = modem ]; then
 		d=$(tg_trip_delta "$cpu" "$modem" "$TRIP_BOOST_OFFSET")

@@ -238,7 +238,7 @@ return view.extend({
 		// temperature input at all. Saying so beats a page full of dashes.
 		if (noSensor)
 			banner.push(E('div', {},
-				_('No thermal sensor was found, so there is nothing to watch on this hardware. The service stays idle and takes no action.')));
+				_('No thermal sensor was found, so the processor is not watched on this hardware. The modem thresholds still apply while the modem reports a temperature.')));
 
 		// A stage that is still applied while nothing is watching is the one
 		// thing an operator has to be told about, so it comes before the rest.

@@ -2,12 +2,25 @@ name: ci
 
 on:
   push:
-    branches: [ main ]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   shellcheck:
     runs-on: ubuntu-latest
+    # The shell files both steps check, the init script aside. The same list
+    # heads the check list in CLAUDE.md.
+    env:
+      SHELL_FILES: >-
+        thermal-guard/files/usr/sbin/thermal-guard
+        thermal-guard/files/usr/share/thermal-guard/backends.sh
+        thermal-guard/files/usr/share/thermal-guard/trips.sh
+        thermal-guard/files/usr/libexec/thermal-guard-collectd
+        thermal-guard/files/etc/uci-defaults/90-thermal-guard-trip-base
+        tests/run-selftest.sh
+        tests/run-integration.sh
+        tests/functions.sh
+        tests/build-jsonfilter.sh
     steps:
       - uses: actions/checkout@v4
       # Ubuntu ships 0.9.0, which does not know the busybox dialect
@@ -24,22 +37,40 @@ jobs:
           shellcheck --version
       - name: Lint shell sources
         run: |
-          shellcheck -s busybox \
-            thermal-guard/files/usr/sbin/thermal-guard \
-            thermal-guard/files/usr/share/thermal-guard/backends.sh \
-            thermal-guard/files/usr/share/thermal-guard/trips.sh \
-            thermal-guard/files/usr/libexec/thermal-guard-collectd \
-            tests/run-selftest.sh \
-            tests/run-integration.sh
+          shellcheck -s busybox $SHELL_FILES
           # rc.common consumes START/STOP/USE_PROCD and shellcheck cannot follow the source
           shellcheck -s busybox -e SC1091,SC2034 thermal-guard/files/etc/init.d/thermal-guard
+      # A line end has to come from an escape, not from the source text, and
+      # shellcheck does not look. The scanner proves itself on planted files first.
+      - name: No line breaks inside quoted strings
+        run: |
+          python3 tests/check-quoted-newlines.py --selftest
+          python3 tests/check-quoted-newlines.py $SHELL_FILES \
+            thermal-guard/files/etc/init.d/thermal-guard
 
   selftest:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install busybox
-        run: sudo apt-get update && sudo apt-get install -y busybox
+      - name: Install busybox and what jsonfilter needs to build
+        run: sudo apt-get update && sudo apt-get install -y busybox cmake libjson-c-dev
+      # The build script pins the libubox and jsonpath commits, so its hash
+      # changes with them.
+      - name: Cache jsonfilter
+        id: jsonfilter-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/jsonfilter/bin
+          key: jsonfilter-${{ hashFiles('tests/build-jsonfilter.sh') }}
+      - name: Build jsonfilter
+        if: steps.jsonfilter-cache.outputs.cache-hit != 'true'
+        run: sh tests/build-jsonfilter.sh ~/jsonfilter
+      - name: Put jsonfilter on PATH
+        run: echo "$HOME/jsonfilter/bin" >> "$GITHUB_PATH"
+      # The suites skip their netifd cases without jsonfilter. Here that would
+      # end in a green run full of skips, so a missing one fails the job.
+      - name: Require jsonfilter
+        run: command -v jsonfilter
       - name: Run the decision logic selftest
         run: sh tests/run-selftest.sh
       - name: Run the state and reset integration tests
@@ -64,6 +95,10 @@ jobs:
           node --check luci-app-thermal-guard/htdocs/luci-static/resources/view/thermal-guard/config.js
           node --check luci-app-thermal-guard/htdocs/luci-static/resources/view/thermal-guard/monitor.js
           node --check luci-app-thermal-guard/htdocs/luci-static/resources/view/status/include/11_thermal-guard.js
+      - name: Install gettext
+        run: sudo apt-get update && sudo apt-get install -y gettext
+      - name: Check the translations
+        run: msgfmt --check -o /dev/null luci-app-thermal-guard/po/de/thermal-guard.po
 
   json:
     runs-on: ubuntu-latest
@@ -75,3 +110,31 @@ jobs:
                    luci-app-thermal-guard/root/usr/share/rpcd/acl.d/*.json; do
             python3 -m json.tool "$f" > /dev/null
           done
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      # v4.4.0, pinned by commit like every step of this job, which publishes
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # Catches Makefile and DEPENDS errors before a device sees them.
+      - name: Build both packages in the OpenWrt SDK
+        # v11
+        uses: openwrt/gh-action-sdk@7fc2640243284ecc44f4a9c3f749a61746ee02cb
+        env:
+          # The release and target the boards' image is built from. Raise it
+          # together with that image, not on its own.
+          ARCH: mediatek-filogic-25.12.5
+          PACKAGES: thermal-guard luci-app-thermal-guard
+      # The SDK only warns when it skips a package it could not enable, and the
+      # step stays green. A missing package fails the job here.
+      - name: Require both packages
+        run: |
+          ls bin/packages/*/action/thermal-guard-[0-9]*.apk
+          ls bin/packages/*/action/luci-app-thermal-guard-[0-9]*.apk
+      - name: Keep the packages for install tests
+        # v7.0.1, pinned by commit because this step publishes artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: packages-mediatek-filogic
+          path: bin/packages/*/action/*.apk
+          if-no-files-found: error

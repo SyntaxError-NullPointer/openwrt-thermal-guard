@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=thermal-guard
-PKG_VERSION:=1.5.0
+PKG_VERSION:=2.0.0
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only
@@ -21,7 +21,7 @@ define Package/thermal-guard
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Overheating protection with staged mitigation
-  DEPENDS:=+libubox +ubus +coreutils-timeout
+  DEPENDS:=+libubox +ubus +coreutils-timeout +jsonfilter
   PKGARCH:=all
 endef
 
@@ -53,7 +53,7 @@ define Build/Compile
 endef
 
 define Package/thermal-guard/install
-	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/libexec $(1)/usr/share/thermal-guard $(1)/etc/config $(1)/etc/init.d $(1)/etc/thermal-guard/hooks $(1)/lib/upgrade/keep.d
+	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/libexec $(1)/usr/share/thermal-guard $(1)/etc/config $(1)/etc/init.d $(1)/etc/uci-defaults $(1)/etc/thermal-guard/hooks $(1)/lib/upgrade/keep.d
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/thermal-guard $(1)/lib/upgrade/keep.d/thermal-guard
 	$(INSTALL_DATA) ./files/etc/thermal-guard/hooks/README $(1)/etc/thermal-guard/hooks/README
 	$(INSTALL_BIN) ./files/usr/sbin/thermal-guard $(1)/usr/sbin/thermal-guard
@@ -61,6 +61,7 @@ define Package/thermal-guard/install
 	$(INSTALL_DATA) ./files/usr/share/thermal-guard/trips.sh $(1)/usr/share/thermal-guard/trips.sh
 	$(INSTALL_CONF) ./files/etc/config/thermal-guard $(1)/etc/config/thermal-guard
 	$(INSTALL_BIN) ./files/etc/init.d/thermal-guard $(1)/etc/init.d/thermal-guard
+	$(INSTALL_BIN) ./files/etc/uci-defaults/90-thermal-guard-trip-base $(1)/etc/uci-defaults/
 	$(INSTALL_BIN) ./files/usr/libexec/thermal-guard-collectd $(1)/usr/libexec/thermal-guard-collectd
 endef
 

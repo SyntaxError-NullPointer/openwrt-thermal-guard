@@ -14,6 +14,12 @@ tg_int() {
 	esac
 }
 
+# Whether a program or function is there. The one place that asks, so the
+# selftest can take a tool away without touching the host.
+tg_have() {
+	command -v "$1" >/dev/null 2>&1
+}
+
 # Absolute path, no .. and no wildcards. Stops UCI from pointing us at random files.
 tg_path_ok() {
 	case "$1" in
@@ -35,7 +41,7 @@ tg_path_under() {
 
 tg_path_thermal() { tg_path_under "$1" "$THERMAL_ROOT/"; }
 tg_path_hwmon() {
-	tg_path_under "$1" /sys/class/hwmon/ || tg_path_under "$1" /sys/devices/
+	tg_path_under "$1" "$HWMON_ROOT/" || tg_path_under "$1" /sys/devices/
 }
 # Boards differ on where the SoC sensor lives: a thermal zone on most targets,
 # a hwmon node on x86 with coretemp. Both have to stay reachable.
@@ -58,9 +64,9 @@ tg_path_dev() { tg_path_under "$1" /dev/; }
 # preferred where present because it can send a header; uclient-fetch ships in
 # the OpenWrt base but has no way to set one.
 tg_fetcher() {
-	command -v curl >/dev/null 2>&1 && { echo curl; return; }
-	command -v uclient-fetch >/dev/null 2>&1 && { echo uclient-fetch; return; }
-	command -v wget >/dev/null 2>&1 && { echo wget; return; }
+	tg_have curl && { echo curl; return; }
+	tg_have uclient-fetch && { echo uclient-fetch; return; }
+	tg_have wget && { echo wget; return; }
 }
 
 # Curl reads its config file as directives, and one of them writes a file. A
@@ -86,24 +92,25 @@ tg_notify_http() {
 
 	case "$NOTIFY_URL" in
 		http://?*|https://?*) ;;
-		*) tg_log "notify_url is not an http or https address, not sending"; return 1 ;;
+		*) tg_log "notify_url is not an http or https address, not sending" warning; return 1 ;;
 	esac
 	if ! tg_http_safe "$NOTIFY_URL"; then
-		tg_log "notify_url contains characters that are not allowed in one, not sending"
+		tg_log "notify_url contains characters that are not allowed in one, not sending" warning
 		return 1
 	fi
 	if [ -n "$NOTIFY_HEADER" ] && ! tg_http_safe "$NOTIFY_HEADER"; then
-		tg_log "notify_header contains characters that are not allowed in one, not sending"
+		tg_log "notify_header contains characters that are not allowed in one, not sending" warning
 		return 1
 	fi
 
 	tool=$(tg_fetcher)
 	[ -n "$tool" ] || {
-		tg_log "no curl or wget available, cannot send notifications"
+		tg_log "no curl or wget available, cannot send notifications" warning
 		return 1
 	}
 
 	if [ "$tool" = curl ]; then
+		NOTIFY_HEADER_TOLD=""
 		mkdir -p "$STATE_DIR"
 		cfg="$STATE_DIR/notify.conf"
 		: > "$cfg"
@@ -116,8 +123,16 @@ tg_notify_http() {
 		return $rc
 	fi
 
-	[ -n "$NOTIFY_HEADER" ] && tg_log "$tool cannot send a header, install curl for authenticated webhooks"
-	"$tool" -q -O /dev/null --post-data="$1" "$NOTIFY_URL" >/dev/null 2>&1
+	# Said once per fetcher, not per message and not per retry of the outbox.
+	if [ -z "$NOTIFY_HEADER" ]; then
+		NOTIFY_HEADER_TOLD=""
+	elif [ "$NOTIFY_HEADER_TOLD" != "$tool" ]; then
+		tg_log "$tool cannot send a header, install curl for authenticated webhooks" warning
+		NOTIFY_HEADER_TOLD=$tool
+	fi
+	# -T bounds the network wait only, the outer limit also covers a hung DNS lookup.
+	timeout "$HTTP_TIMEOUT" "$tool" -q -T 15 -O /dev/null --post-data="$1" "$NOTIFY_URL" \
+		>/dev/null 2>&1
 }
 
 # The escape hatch for anything HTTP cannot express, a local mailer for example.
@@ -126,7 +141,7 @@ tg_notify_http() {
 tg_notify_hook() {
 	local hook="$HOOK_DIR/notify"
 	[ -x "$hook" ] || return 1
-	printf '%s\n' "$1" | "$hook" >/dev/null 2>&1
+	printf '%s\n' "$1" | timeout -k 5 "$HOOK_TIMEOUT" "$hook" >/dev/null 2>&1
 }
 
 # Run an AT command through a lock. Several daemons and LuCI apps share one port
@@ -134,25 +149,39 @@ tg_notify_hook() {
 # lock and the query are bounded: a modem that hangs, or a program that sits on
 # the lock, must not stop the whole loop. BusyBox flock has no -w, so the outer
 # timeout covers the wait and the inner one the query.
+# Without flock the query still runs, the modem reading matters more than the
+# lock. But another program on the port can garble it now, so say so once.
+tg_at_unlocked() {
+	[ "$FLOCK_TOLD" = 1 ] && return 0
+	tg_cfg_log "no flock command, AT queries run without the shared lock"
+	[ "$DAEMON" = 1 ] && FLOCK_TOLD=1
+	return 0
+}
+
 tg_at() {
-	local port="$1" cmd="$2"
+	local port="$1" cmd="$2" lock=$AT_LOCK
+	# Checked here as well as at load: the value goes to flock, which creates
+	# the file it names.
+	tg_path_lock "$lock" || lock=/var/lock/modem-at.lock
 	[ -c "$port" ] || return 1
-	command -v sms_tool >/dev/null 2>&1 || return 1
-	if ! command -v timeout >/dev/null 2>&1; then
+	tg_have sms_tool || return 1
+	if ! tg_have timeout; then
 		if [ "$AT_NO_TIMEOUT_TOLD" = 0 ]; then
 			tg_cfg_log "no timeout command, AT queries run without a time limit"
 			[ "$DAEMON" = 1 ] && AT_NO_TIMEOUT_TOLD=1
 		fi
-		if command -v flock >/dev/null 2>&1; then
-			flock "$AT_LOCK" sms_tool -d "$port" at "$cmd" 2>/dev/null
+		if tg_have flock; then
+			flock "$lock" sms_tool -d "$port" at "$cmd" 2>/dev/null
 		else
+			tg_at_unlocked
 			sms_tool -d "$port" at "$cmd" 2>/dev/null
 		fi
 		return
 	fi
-	if command -v flock >/dev/null 2>&1; then
-		timeout "$AT_WAIT" flock "$AT_LOCK" timeout "$AT_TIMEOUT" sms_tool -d "$port" at "$cmd" 2>/dev/null
+	if tg_have flock; then
+		timeout "$AT_WAIT" flock "$lock" timeout "$AT_TIMEOUT" sms_tool -d "$port" at "$cmd" 2>/dev/null
 	else
+		tg_at_unlocked
 		timeout "$AT_TIMEOUT" sms_tool -d "$port" at "$cmd" 2>/dev/null
 	fi
 }
@@ -287,9 +316,17 @@ tg_fan_resolve_pwm() {
 }
 
 tg_fan_set_pwm_path() {
-	[ "$1" = "$PWM_PATH" ] && return 0
-	tg_cfg_log "fan pwm path '$PWM_PATH' unusable, using detected '$1'"
+	local old=$PWM_PATH
+	[ "$1" = "$old" ] && return 0
 	PWM_PATH="$1"
+	[ "$PWM_PATH_TOLD" = "$old>$1" ] && return 0
+	if [ -z "$old" ]; then
+		tg_cfg_log "fan pwm output detected at '$1'" info
+	else
+		tg_cfg_log "fan pwm path '$old' unusable, using detected '$1'"
+	fi
+	[ "$DAEMON" = 1 ] && PWM_PATH_TOLD="$old>$1"
+	return 0
 }
 
 # hwmon numbers are assigned in driver probe order, so hwmon2 today can be
@@ -298,7 +335,7 @@ tg_fan_set_pwm_path() {
 # silent failure this daemon exists to prevent.
 tg_fan_find_hwmon() {
 	local h
-	for h in /sys/class/hwmon/hwmon*; do
+	for h in "$HWMON_ROOT"/hwmon*; do
 		[ -r "$h/name" ] || continue
 		case "$(cat "$h/name" 2>/dev/null)" in
 			pwmfan|pwm-fan|pwm_fan) echo "$h"; return ;;
@@ -403,14 +440,14 @@ tg_fan_check_owner() {
 		FAN_FOREIGN=0
 		return 0
 	fi
-	[ "$FAN_FOREIGN" = 1 ] || tg_log "fan was set to $want but reads $have, another controller owns it. Set fan_mode=none to leave it alone."
+	[ "$FAN_FOREIGN" = 1 ] || tg_log "fan was set to $want but reads $have, another controller owns it. Set fan_mode=none to leave it alone." warning
 	FAN_FOREIGN=1
-	tg_fan_full || tg_log "could not reassert the fan (mode $FAN_MODE)"
+	tg_fan_full || tg_log "could not reassert the fan (mode $FAN_MODE)" crit
 }
 
 tg_fan_rpm() {
 	local h
-	for h in /sys/class/hwmon/hwmon*/fan1_input; do
+	for h in "$HWMON_ROOT"/hwmon*/fan1_input; do
 		[ -r "$h" ] && { cat "$h"; return; }
 	done
 }
@@ -461,7 +498,41 @@ tg_fan_full() {
 
 # Hand the fan back. Only called on an explicit reset or a clean stop, never on
 # the escalation path, so a crash leaves the fan running.
+# Hands the zone to governor $1 and reads the policy back. The kernel refuses
+# a governor it was built without, which would leave the zone on user_space
+# and the fan at full speed with nobody told. step_wise is in every kernel
+# with thermal support. Without available_policies the name is written as is.
+tg_fan_zone_policy() {
+	local want="$1" avail got
+	avail=$(cat "$FAN_ZONE/available_policies" 2>/dev/null)
+	if [ -n "$avail" ]; then
+		case " $avail " in
+			*" $want "*) ;;
+			*)
+				tg_log "governor '$want' is not available on this zone, handing it to step_wise" warning
+				want=step_wise ;;
+		esac
+	fi
+	# Braces, so a failed open is as quiet as a failed write.
+	{ echo "$want" > "$FAN_ZONE/policy"; } 2>/dev/null
+	got=$(cat "$FAN_ZONE/policy" 2>/dev/null)
+	[ "$got" = "$want" ] && return 0
+	tg_log "zone still reports policy '${got:-nothing}' after handing it back" crit
+	return 1
+}
+
+# Writes $2 to $1 and reads it back; $3 names the value in the log.
+tg_fan_write_back() {
+	local got
+	{ echo "$2" > "$1"; } 2>/dev/null
+	got=$(tg_int "$(cat "$1" 2>/dev/null)")
+	[ "$got" = "$2" ] && return 0
+	tg_log "$3 reads '${got:-nothing}' after handing it back, wrote '$2'" crit
+	return 1
+}
+
 tg_fan_release() {
+	local mode=""
 	case "$FAN_MODE" in
 		cooling_device)
 			# Nothing to hand back where no zone drives the cooling device.
@@ -472,10 +543,10 @@ tg_fan_release() {
 			# nothing was recorded, because the state was lost, does the
 			# configured default get used as the safety net.
 			if [ -n "$FAN_SAVED_POLICY" ]; then
-				echo "$FAN_SAVED_POLICY" > "$FAN_ZONE/policy" 2>/dev/null
+				tg_fan_zone_policy "$FAN_SAVED_POLICY"
 			else
 				tg_log "no saved fan policy, handing the zone to $FAN_GOVERNOR"
-				echo "$FAN_GOVERNOR" > "$FAN_ZONE/policy" 2>/dev/null
+				tg_fan_zone_policy "$FAN_GOVERNOR"
 			fi
 			FAN_SAVED_POLICY=""
 			;;
@@ -484,16 +555,24 @@ tg_fan_release() {
 			# usual pwm chips; 0 is never written, because on some of them that
 			# stops the fan, which is the opposite of what a release should do.
 			if [ -n "$PWM_ENABLE_PATH" ] && tg_path_hwmon "$PWM_ENABLE_PATH"; then
-				if [ -n "$FAN_SAVED_ENABLE" ] && [ "$FAN_SAVED_ENABLE" != 0 ]; then
-					echo "$FAN_SAVED_ENABLE" > "$PWM_ENABLE_PATH" 2>/dev/null
-				else
+				mode=$FAN_SAVED_ENABLE
+				if [ -z "$mode" ] || [ "$mode" = 0 ]; then
 					tg_log "no saved fan control mode, handing the fan to automatic"
-					echo 2 > "$PWM_ENABLE_PATH" 2>/dev/null
+					mode=2
 				fi
+				tg_fan_write_back "$PWM_ENABLE_PATH" "$mode" "fan control mode"
 			fi
-			if [ -n "$FAN_SAVED_PWM" ] && [ -n "$PWM_PATH" ] && tg_path_hwmon "$PWM_PATH"; then
-				echo "$FAN_SAVED_PWM" > "$PWM_PATH" 2>/dev/null
-			fi
+			# The duty cycle only in manual mode, or where there is no mode to
+			# set. In any other mode the chip drives it: the value saved before
+			# the takeover means nothing, some drivers refuse it with EINVAL,
+			# and reading it back would report the chip's own value as failure.
+			case "$mode" in
+				''|1)
+					if [ -n "$FAN_SAVED_PWM" ] && [ -n "$PWM_PATH" ] && tg_path_hwmon "$PWM_PATH"; then
+						tg_fan_write_back "$PWM_PATH" "$FAN_SAVED_PWM" "fan pwm"
+					fi
+					;;
+			esac
 			FAN_SAVED_ENABLE=""; FAN_SAVED_PWM=""
 			;;
 	esac
@@ -520,7 +599,7 @@ tg_find_cpu_sensor() {
 		esac
 	done
 
-	for f in /sys/class/hwmon/hwmon*/temp1_input; do
+	for f in "$HWMON_ROOT"/hwmon*/temp1_input; do
 		[ -r "$f" ] || continue
 		name=$(cat "${f%/*}/name" 2>/dev/null)
 		case "$name" in
@@ -540,7 +619,7 @@ tg_find_cpu_sensor() {
 # hwmon temperature input.
 tg_has_any_sensor() {
 	local f
-	for f in "$THERMAL_ROOT"/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp*_input; do
+	for f in "$THERMAL_ROOT"/thermal_zone*/temp "$HWMON_ROOT"/hwmon*/temp*_input; do
 		[ -r "$f" ] && return 0
 	done
 	return 1
@@ -587,7 +666,7 @@ tg_modem_fibocom() {
 # Sets MODEM_VAL and MODEM_SRC. Empty value means "no reading", which the logic
 # treats as "condition met" so a dead modem never blocks an escalation.
 tg_read_modem() {
-	local port v
+	local port v rc
 	MODEM_VAL=""; MODEM_SRC=""
 
 	case "$MODEM_SOURCE" in
@@ -602,7 +681,14 @@ tg_read_modem() {
 		command)
 			# An executable from the hook directory, not a string from UCI.
 			[ -x "$HOOK_DIR/modem-temp" ] || return 0
-			v=$(tg_int "$("$HOOK_DIR/modem-temp" 2>/dev/null)")
+			v=$({ timeout -k 5 "$AT_TIMEOUT" "$HOOK_DIR/modem-temp"; } 2>/dev/null)
+			rc=$?
+			# Stopped at its time limit: coreutils timeout says 124, or 137 for
+			# the KILL a hook that ignored TERM gets; a BusyBox timeout dies of
+			# the signal itself (143, 137). What such a hook printed before is
+			# no reading.
+			[ "$rc" -eq 124 ] || [ "$rc" -gt 128 ] && return 0
+			v=$(tg_int "$v")
 			[ -n "$v" ] && { MODEM_VAL=$v; MODEM_SRC="command"; }
 			return 0
 			;;
@@ -629,40 +715,62 @@ tg_read_modem() {
 # "name=degrees" per line. The source of the processor reading is skipped so it does
 # not show up twice, and hwmon entries win over thermal zones with the same name.
 tg_read_extra_sensors() {
-	local f name label raw seen=" "
+	local f name label raw seen=" " cpu_zone="" cpu_real="" cpu
 	[ "$EXTRA_SENSORS" = 1 ] || return 0
 
-	for f in /sys/class/hwmon/hwmon*/temp*_input; do
+	# The processor is shown on its own, so its sensor is skipped by path. A
+	# thermal zone is also mirrored by the kernel as a hwmon node named after
+	# the zone's type, which the path does not catch: that mirror is skipped
+	# by name. Neither check makes the other redundant.
+	# The loops walk class paths. A cpu_temp_path set by hand in its
+	# /sys/devices form matches none of them, so only then is it resolved and
+	# compared resolved: that costs a readlink per sensor, which the default
+	# and every detected path, all in class form, do not need.
+	case "$CPU_TEMP_PATH" in
+		"$THERMAL_ROOT"/*|"$HWMON_ROOT"/*) ;;
+		*) cpu_real=$(readlink -f "$CPU_TEMP_PATH" 2>/dev/null) ;;
+	esac
+	cpu=${cpu_real:-$CPU_TEMP_PATH}
+	# The kernel names a zone's hwmon mirror after the zone type with "-" turned
+	# into "_", hwmon names carry no hyphen: zone cpu-thermal, mirror
+	# cpu_thermal. So the zone side is normalised, once, and compared as is.
+	case "$cpu" in
+		*/thermal_zone*/temp)
+			cpu_zone=$(cat "${cpu%/temp}/type" 2>/dev/null | tr '-' '_') ;;
+	esac
+
+	for f in "$HWMON_ROOT"/hwmon*/temp*_input; do
 		[ -r "$f" ] || continue
+		[ "$f" = "$CPU_TEMP_PATH" ] && continue
+		[ -n "$cpu_real" ] && [ "$(readlink -f "$f")" = "$cpu_real" ] && continue
 		name=$(cat "${f%/*}/name" 2>/dev/null)
 		[ -n "$name" ] || continue
+		[ -n "$cpu_zone" ] && [ "$name" = "$cpu_zone" ] && continue
 		# a chip with several sensors labels them, use that to tell them apart
 		label=$(cat "${f%_input}_label" 2>/dev/null)
 		[ -n "$label" ] && name="$name $label"
-		case "$name" in *cpu_thermal*|*cpu-thermal*) continue ;; esac
 		case "$seen" in *" $name "*) continue ;; esac
 		raw=$(tg_int "$(cat "$f" 2>/dev/null)")
 		[ -n "$raw" ] || continue
 		[ "$raw" -gt 1000 ] && raw=$((raw / 1000))
 		[ "$raw" -gt -100 ] && [ "$raw" -lt 200 ] || continue
 		seen="$seen$name "
-		printf '%s=%s
-' "$name" "$raw"
+		printf '%s=%s\n' "$name" "$raw"
 	done
 
 	for f in "$THERMAL_ROOT"/thermal_zone*/temp; do
 		[ -r "$f" ] || continue
+		[ "$f" = "$CPU_TEMP_PATH" ] && continue
+		[ -n "$cpu_real" ] && [ "$(readlink -f "$f")" = "$cpu_real" ] && continue
 		name=$(cat "${f%/*}/type" 2>/dev/null)
 		[ -n "$name" ] || continue
-		case "$name" in *cpu_thermal*|*cpu-thermal*) continue ;; esac
 		case "$seen" in *" $name "*) continue ;; esac
 		raw=$(tg_int "$(cat "$f" 2>/dev/null)")
 		[ -n "$raw" ] || continue
 		[ "$raw" -gt 1000 ] && raw=$((raw / 1000))
 		[ "$raw" -gt -100 ] && [ "$raw" -lt 200 ] || continue
 		seen="$seen$name "
-		printf '%s=%s
-' "$name" "$raw"
+		printf '%s=%s\n' "$name" "$raw"
 	done
 
 	tg_read_mtwifi
@@ -675,7 +783,7 @@ tg_read_extra_sensors() {
 # instead of renaming the other one.
 tg_read_mtwifi() {
 	local ifname flags raw n=-1
-	command -v iwpriv >/dev/null 2>&1 || return 0
+	tg_have iwpriv || return 0
 	for ifname in ra0 rax0 rai0 ray0 rae0 raz0; do
 		n=$((n + 1))
 		[ -r "$NET_ROOT/$ifname/flags" ] || continue
@@ -690,7 +798,7 @@ tg_read_mtwifi() {
 
 tg_mtwifi_temp() { # $1 interface
 	local out v
-	if command -v timeout >/dev/null 2>&1; then
+	if tg_have timeout; then
 		out=$(timeout 3 iwpriv "$1" stat 2>/dev/null)
 	else
 		out=$(iwpriv "$1" stat 2>/dev/null)
@@ -722,7 +830,7 @@ tg_modem_cfun_set() { # $1 level
 		[ "$got" = "$1" ] && return 0
 		i=$((i + 1))
 	done
-	tg_log "modem reports CFUN ${got:-nothing} after AT+CFUN=$1"
+	tg_log "modem reports CFUN ${got:-nothing} after AT+CFUN=$1" crit
 	return 1
 }
 
@@ -736,8 +844,8 @@ tg_iface_name_ok() {
 
 # "true" or "false" as netifd reports it, empty for an interface it does not know.
 tg_iface_up_state() {
-	ubus call "network.interface.$1" status 2>/dev/null \
-		| sed -n 's/^[[:space:]]*"up": *\([a-z]*\).*/\1/p' | head -n1
+	timeout "$UBUS_TIMEOUT" ubus call "network.interface.$1" status 2>/dev/null \
+		| jsonfilter -e '@.up' 2>/dev/null
 }
 
 tg_action_interface_down() { tg_iface_set "${ACTION_INTERFACE:-$UPLINK_INTERFACE}" false; }
@@ -747,23 +855,78 @@ tg_action_interface_up() { tg_iface_set "${ACTION_INTERFACE:-$UPLINK_INTERFACE}"
 tg_iface_set() { # $1 interface, $2 true or false
 	local i=0 got=""
 	if ! tg_iface_name_ok "$1"; then
-		tg_log "interface action has no usable interface, set action_interface or uplink_interface"
+		tg_log "interface action has no usable interface, set action_interface or uplink_interface" warning
 		return 1
 	fi
-	command -v ifdown >/dev/null 2>&1 || return 1
-	if [ "$2" = false ]; then ifdown "$1" >/dev/null 2>&1; else ifup "$1" >/dev/null 2>&1; fi
+	tg_have ifdown || return 1
+	if [ "$2" = false ]; then
+		timeout "$CMD_TIMEOUT" ifdown "$1" >/dev/null 2>&1
+	else
+		timeout "$CMD_TIMEOUT" ifup "$1" >/dev/null 2>&1
+	fi
 	while [ "$i" -lt 3 ]; do
 		[ "$i" -gt 0 ] && sleep "$CFUN_SETTLE"
 		got=$(tg_iface_up_state "$1")
 		[ "$got" = "$2" ] && return 0
 		i=$((i + 1))
 	done
-	tg_log "interface $1 reports up=${got:-unknown} after if$([ "$2" = false ] && echo down || echo up)"
+	tg_log "interface $1 reports up=${got:-unknown} after if$([ "$2" = false ] && echo down || echo up)" crit
 	return 1
 }
 
-tg_action_wifi_off() { command -v wifi >/dev/null 2>&1 && wifi down >/dev/null 2>&1; }
-tg_action_wifi_on()  { command -v wifi >/dev/null 2>&1 && wifi up >/dev/null 2>&1; }
+tg_action_wifi_off() { tg_wifi_set down; }
+tg_action_wifi_on()  { tg_wifi_set up; }
+
+# netifd's view of the radios that are not disabled, as "<radios> <up>",
+# nothing when it does not answer. One filter for both counts, so they come
+# from the same radios. Written as !(=true), because != does not match a radio
+# without a "disabled" key at all.
+tg_wifi_radios() {
+	local json v radios=0 up=0
+	json=$(timeout "$UBUS_TIMEOUT" ubus call network.wireless status 2>/dev/null) || return 0
+	[ -n "$json" ] || return 0
+	for v in $(printf '%s\n' "$json" | jsonfilter -e '@[!(@.disabled=true)].up' 2>/dev/null); do
+		radios=$((radios + 1))
+		[ "$v" = true ] && up=$((up + 1))
+	done
+	echo "$radios $up"
+}
+
+# Like the modem, the command goes out again on every attempt, and success is
+# what netifd reports afterwards. Starting hostapd per radio takes longer than
+# a modem answers, hence its own settle time and more attempts.
+tg_wifi_set() { # $1 down or up
+	local i=0 state radios="" up=""
+	if ! tg_have wifi; then
+		tg_log "no wifi command, cannot switch Wi-Fi $1" warning
+		return 1
+	fi
+	while [ "$i" -lt "$WIFI_TRIES" ]; do
+		timeout "$CMD_TIMEOUT" wifi "$1" >/dev/null 2>&1
+		[ "$WIFI_SETTLE" -gt 0 ] && sleep "$WIFI_SETTLE"
+		state=$(tg_wifi_radios)
+		if [ -n "$state" ]; then
+			radios=${state%% *}; up=${state#* }
+			# Nothing to switch off is not a success: the stage would claim an
+			# effect it never had. Nothing to bring back is fine, a reset must
+			# not fail on it.
+			if [ "$radios" -eq 0 ]; then
+				[ "$1" = up ] && return 0
+				tg_log "netifd manages no Wi-Fi radio, wifi_off switched nothing off" crit
+				return 1
+			fi
+			[ "$1" = down ] && [ "$up" -eq 0 ] && return 0
+			[ "$1" = up ] && [ "$up" -ge "$radios" ] && return 0
+		fi
+		i=$((i + 1))
+	done
+	if [ -z "$state" ]; then
+		tg_log "netifd reports no Wi-Fi status after wifi $1" crit
+	else
+		tg_log "Wi-Fi reports $up of $radios radio(s) up after wifi $1" crit
+	fi
+	return 1
+}
 
 # ---- uplink ----------------------------------------------------------------
 
@@ -771,18 +934,30 @@ tg_action_wifi_on()  { command -v wifi >/dev/null 2>&1 && wifi up >/dev/null 2>&
 # way out" from "the only way out is the thing we are about to switch off".
 tg_modem_l3dev() {
 	[ -n "$UPLINK_INTERFACE" ] || return 0
-	ubus call "network.interface.$UPLINK_INTERFACE" status 2>/dev/null \
-		| sed -n 's/.*"l3_device": *"\([^"]*\)".*/\1/p' | head -n1
+	timeout "$UBUS_TIMEOUT" ubus call "network.interface.$UPLINK_INTERFACE" status 2>/dev/null \
+		| jsonfilter -e '@.l3_device' 2>/dev/null
 }
 
 tg_default_devs() {
+	tg_have ip || return 0
 	{ ip -4 route show default; ip -6 route show default; } 2>/dev/null \
 		| sed -n 's/.* dev \([^ ]*\).*/\1/p'
 }
 
 # 0 = there is a default route that does not run through the modem.
+# Without ip nothing can tell whether a route exists, and a message that waits
+# for one nobody can see is never sent. Unknown therefore means send now.
+tg_uplink_unknown() {
+	tg_have ip && return 1
+	[ "$IP_TOLD" = 1 ] ||
+		tg_cfg_log "no ip command, cannot tell whether another uplink exists, sending at once"
+	[ "$DAEMON" = 1 ] && IP_TOLD=1
+	return 0
+}
+
 tg_alt_uplink() {
 	local md dev
+	tg_uplink_unknown && return 0
 	md=$(tg_modem_l3dev)
 	for dev in $(tg_default_devs); do
 		[ -n "$md" ] && [ "$dev" = "$md" ] && continue
@@ -791,4 +966,4 @@ tg_alt_uplink() {
 	return 1
 }
 
-tg_any_uplink() { [ -n "$(tg_default_devs)" ]; }
+tg_any_uplink() { tg_uplink_unknown || [ -n "$(tg_default_devs)" ]; }

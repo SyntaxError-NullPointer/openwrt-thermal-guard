@@ -12,4 +12,5 @@ trap 'rm -rf "$tmp"' EXIT
 STATE_DIR="$tmp/state" \
 STATUS_FILE="$tmp/status" \
 LIB_DIR="$root/thermal-guard/files/usr/share/thermal-guard" \
+FIXTURE_DIR="$root/tests/fixtures" \
 	sh "$root/thermal-guard/files/usr/sbin/thermal-guard" selftest

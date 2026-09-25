@@ -40,10 +40,12 @@ SoC and modem temperature and, when the box runs hot, escalates in three stages:
 
 The web interface counts stages from one, the daemon and the status file count
 them from zero, so stage 1 of 3 is `stage=0` in `thermal-guard status`. What
-stages 2 and 3 do is configurable; the table shows the defaults. Each action is
-read back rather than assumed: the modem is asked for its state (`AT+CFUN?`),
-`interface_down` waits for netifd to report the interface down. An action that
-does not confirm counts as failed, and the failure is notified.
+stages 2 and 3 do is configurable; the table shows the defaults. Each built in
+action is read back rather than assumed: the modem is asked for its state
+(`AT+CFUN?`), `interface_down` waits for netifd to report the interface down,
+`wifi_off` waits for netifd to report no enabled radio up. An action that does not
+confirm counts as failed, and the failure is notified. A `command` hook counts
+by its exit code.
 
 Three design decisions worth knowing before you deploy it:
 
@@ -58,15 +60,18 @@ Three design decisions worth knowing before you deploy it:
   explicit reset, so dying mid-incident is the safe direction.
 
 If a restored stage ever locks you out, reach the box over a wired port or
-serial and run `thermal-guard reset`. Only a device that reached stage 3 can
-have Wi-Fi switched off at boot, and such a device has a fan and a modem, so it
-has wired ports too.
+serial and run `thermal-guard reset`. Only a device that reached a stage whose
+action is `wifi_off` or `interface_down` (stage 3 of 3 with the defaults) comes
+back from a reboot with that connection still off, and such a device has a fan
+and a modem, so it has wired ports too.
 
 Every transition needs two consecutive readings above the threshold, which keeps
-sensor glitches from triggering anything. A missing reading counts as "condition
-met", so a modem that stopped answering never blocks an escalation.
+sensor glitches from triggering anything. A missing reading never blocks an
+escalation: at a threshold it simply does not count, on the hold path it counts
+as no drop, so it never delays stage 2 of 3, and a reference missing at stage
+entry is taken from the first reading after the gap.
 
-Escalating from stage 1 on time alone, when the temperature has not dropped, is
+Escalating from stage 1 of 3 on time alone, when the temperature has not dropped, is
 the part that earns its keep. The guard never asks whether the fan turned; it
 asks whether the box got cooler. That covers a fan that failed, a fan cable
 that came off, and the case that prompted this package: a fan controller whose
@@ -135,14 +140,18 @@ opkg install thermal-guard luci-app-thermal-guard   # or: apk add ...
 
 Two LuCI pages: **Status → Thermal Guard** shows the temperatures, the fan and
 the current stage, and clears the stages; **System → Thermal Guard** edits the
-configuration. A changed option is picked up within one interval, so Apply
-needs no restart.
+configuration. A changed option is picked up within one interval, and a
+deleted one is back at its default by then, so Apply needs no restart.
 
 The package depends on `coreutils-timeout`: every AT query runs under a time
-limit, so a hung modem costs one reading instead of the whole loop. Optional
-runtime helpers, none of them a hard dependency: `sms_tool` for the modem AT
-commands, `flock` for the AT lock, `ip` for the uplink check, and `curl` for
-notification headers.
+limit, so a hung modem costs one reading instead of the whole loop. It also
+depends on `jsonfilter` to read netifd's answers; `base-files` ships it on every
+image anyway. Optional runtime helpers, none of them a hard dependency:
+`sms_tool` for the modem AT commands, `flock` for the AT lock, `ip` for the
+uplink check, and `curl` for notification headers. Without `flock` the AT
+queries run without the lock; without `ip` the daemon cannot tell whether a
+route exists and sends every message at once instead of queueing it. Each is
+logged once as a warning.
 
 ## Configuration
 
@@ -157,10 +166,11 @@ read a Quectel or Fibocom modem; driving the fan is an explicit choice.
 | `modem_warn` / `modem_crit` | `80` / `88` | Modem thresholds in °C |
 | `hold_minutes` | `3` | How long a stage must persist before time alone escalates |
 | `hysteresis` | `10` | Degrees below the warn thresholds that count as cooled down |
+| `extra_sensors` | `1` | `0` hides the board's other sensors (Wi-Fi, ethernet phys, NVMe) from the status page |
 | `cpu_temp_path` | `/sys/class/thermal/thermal_zone0/temp` | Sysfs source under `/sys/class/thermal/` or `/sys/class/hwmon/`, degrees or millidegrees. A sensor is looked for when this does not read |
 | `fan_mode` | `none` | `cooling_device`, `pwm`, `auto`. `auto` takes the cooling device if there is one, otherwise it stays `none`; it never picks `pwm` |
 | `fan_cooling_device_type` | `pwm-fan` | Type string used to find the cooling device |
-| `fan_governor` | `step_wise` | Governor the zone is handed back to on reset |
+| `fan_governor` | `step_wise` | Governor the zone is handed back to on reset when no earlier one was saved: `step_wise`, `fair_share`, `bang_bang` or `power_allocator`. Anything else, `user_space` included, means `step_wise`, and so does a governor the kernel was built without |
 | `pwm_path`, `pwm_enable_path` | unset | `pwm` mode only; found by hwmon name when left empty |
 | `pwm_full`, `pwm_idle` | unset | Raw values for fastest and slowest, both required for `pwm`. Without both the fan is left alone |
 | `modem_source` | `auto` | `quectel`, `fibocom`, `file`, `command`, `none` |
@@ -170,7 +180,6 @@ read a Quectel or Fibocom modem; driving the fan is an explicit choice.
 | `trip_boost` | `off` | `modem` lowers the fan's trip points while the modem runs hotter than the CPU, see below |
 | `trip_boost_offset` | `15` | Degrees the modem may run above the CPU before the trips go down, 0 to 40 |
 | `trip_active` | unset | List, baseline of the fan's active trips in °C, ascending, one per trip. Unset means the device tree values |
-| `trip_dt` | set by the daemon | Device tree trips the baseline was made for; a new image with other values is reported |
 | `stage1_action` / `stage2_action` | `modem_radio_off` / `wifi_off` | Also `interface_down`, `command`, which runs a hook, or `none` |
 | `modem_radio_off_at` | `AT+CFUN=4` | Or `AT+CFUN=0` for a modem without flight mode. Nothing else is accepted |
 | `action_interface` | unset | Interface `interface_down` takes down; `uplink_interface` when unset |
@@ -184,6 +193,12 @@ read a Quectel or Fibocom modem; driving the fan is an explicit choice.
 zone off its governor first if one drives it. Prefer this mode wherever the
 board offers it: `max_state` means maximum cooling whichever way the device tree
 runs its `cooling-levels`, so this mode cannot get the polarity wrong.
+
+On reset the zone gets back the governor it had before, or `fan_governor` when
+none was recorded. A governor the running kernel does not list in the zone's
+`available_policies` is replaced by `step_wise`. The policy is read back
+afterwards: a zone that still reports another one is logged as `crit`, since
+then nothing regulates the fan.
 
 A cooling device that no thermal zone binds still works, there is simply nothing
 to take over and nothing to hand back. Whether one is bound is worth knowing,
@@ -201,8 +216,9 @@ nobody catches until this package escalates.
 
 `pwm` writes the duty cycle to sysfs directly. Use it on boards where the fan is
 not wired into a thermal zone. Before taking the chip over, the daemon records
-what it was set to and writes that back on reset, so nothing has to be
-configured for the way out. Leaving `pwm_path` empty is fine: the fan chip is
+its mode and duty cycle. Reset writes the mode back, and the duty cycle where
+the chip was in manual mode; in automatic mode the chip sets it itself. Nothing
+has to be configured for the way out. Leaving `pwm_path` empty is fine: the fan chip is
 looked up by its hwmon name, which survives the renumbering that happens when
 another sensor appears.
 
@@ -247,12 +263,22 @@ device tree values back once and leaves it alone from then on.
 Nothing is written unless `trip_boost` or `trip_active` is set, so a board whose
 fan the kernel already drives keeps its trips as they are.
 
+A new firmware image can bring other trips in its device tree. The first cycle
+with `trip_active` set records the device tree values of that boot in
+`/etc/thermal-guard/trip_base`, which survives a sysupgrade. When a later boot
+finds other values, the log says so, the status file carries
+`trip_dt_changed=1`, and **System → Thermal Guard** offers to use the new values
+or to keep your own. `trip_active` stays in force until you decide. Both
+choices run `thermal-guard trips-keep`, which records the values of the running
+boot. Without `trip_active` the file is neither read nor written.
+
 ### Sharing the modem with another program
 
 A modem answers two overlapping AT conversations with nothing useful, and the
 program that gets the nothing rarely says so. This daemon takes `at_lock` around
 every query. **Anything else on the box that talks to the same port has to take
-the same lock**, or both readings become unreliable.
+the same lock**, or both readings become unreliable. ModemManager cannot, see
+the known limitations below.
 
 That is not a theoretical concern. On a Banana Pi R3 Mini this package was
 installed next to a fan controller that queried the modem without a lock. The
@@ -291,10 +317,17 @@ option notify_url 'https://ntfy.sh/my-topic'
 ```
 
 `curl` is used when it is installed, otherwise `uclient-fetch` from the OpenWrt
-base. Only the former can send `notify_header`, so an authenticated webhook
-either needs `curl` installed or a service that takes its token in the URL. The
-url and the header are passed through a file rather than the command line,
-since `/proc` would otherwise show the token to every local process.
+base, or `wget`. Only `curl` can send `notify_header`, and only `curl` reads the
+address and the header from a file (mode 600) instead of the command line, where
+`/proc` shows them to every local process.
+
+Without `curl` the daemon therefore refuses an address that carries a query
+string or user info (`?token=...`, `user:pass@host`). It logs the reason once
+and sends nothing over HTTP; the notify hook below still works. A secret in the
+path of the address, as in Slack or Discord webhooks or a private ntfy topic,
+cannot be told apart from an ordinary path and is sent as it is. Without `curl`
+it is visible in the process list while the message goes out. Install `curl`
+for such services.
 
 For a delivery HTTP cannot express, put an executable at
 `/etc/thermal-guard/hooks/notify`; it gets the text on stdin. With both set,
@@ -310,7 +343,12 @@ stage is about to switch the modem off.
 for `stage1` and `stage2` when the action is `command`, and for `modem-temp`
 when `modem_source` is `command`. See the `README` installed in that directory.
 The whole of `/etc/thermal-guard/` is listed in `/lib/upgrade/keep.d/`, so
-hooks, `matrix.env` and persisted stages survive a `sysupgrade`.
+hooks and any files they need, persisted stages and `trip_base` survive a
+`sysupgrade`.
+
+Every hook runs under a time limit: 15 s for `notify`, `stage1` and `stage2`,
+5 s for `modem-temp`, which runs every cycle. A hook still running then gets
+TERM, and KILL 5 s later, and counts as failed.
 
 They are files rather than options because the rpcd ACL that lets the web
 interface edit this configuration does not grant write or execute access to
@@ -322,17 +360,33 @@ shell access, and editing the configuration cannot introduce any.
 ```sh
 thermal-guard status            # current stage, readings, fan state
 thermal-guard reset             # clear all stages, hand the fan back, radio on
-thermal-guard test 85 70        # feed readings through one cycle, actions logged only
+thermal-guard trips-keep        # record this boot's device tree trips in trip_base
+thermal-guard test 85 70        # two cycles with these readings, print what they would trigger, change nothing
 thermal-guard selftest          # run the decision logic against its test cases
 ```
 
+`test` runs its two cycles at the same moment, because every stage needs two
+readings in a row. The hold time does not pass in between: from an idle state,
+stage 3 of 3 shows only through `cpu_emergency`, and the escalation over time
+cannot be tried this way. `test 75 66` staying at stage 1 of 3 says nothing
+about it. On a box already in a stage, its hold timers apply.
+
 `/var/run/thermal-guard.status` holds a machine readable snapshot. Everything
-else reads that file, so nothing but the daemon talks to the modem.
+else reads that file, so only the daemon talks to the modem, and `thermal-guard
+reset`, which switches the radio back on under `at_lock`.
 
 ## Where the readings show up
 
 * **Status -> Thermal Guard** is the monitor page: temperatures, fan state, stage.
 * **Status -> Overview** gets a short temperature block, installed with the LuCI app.
+* **Syslog**, tag `thermal-guard`, facility `daemon`: `crit` for a stage, a
+  restored stage, a stage that cannot be persisted and every stage action that
+  failed, the way back after a reset included; `warning` for a rejected option,
+  a missing tool, a sensor that does not read and trips that could not be
+  written; `notice` for cooled down, reset, `trips-keep` and new firmware trips
+  that need a decision; `info` for the rest. `logread -e thermal-guard` shows
+  them all, a remote syslog can filter on the priority. The event log in
+  `/var/run/thermal-guard/log` keeps the same lines without it.
 * **Other sensors** of the board (`extra_sensors`, on by default): every hwmon and
   thermal zone temperature besides the processor, such as Wi-Fi chips, ethernet
   phys and NVMe drives. The proprietary MediaTek Wi-Fi driver `mt_wifi` exposes
@@ -364,6 +418,39 @@ Developed against two boards, which is where the two fan modes come from:
 
 Nothing in the package is board specific, any OpenWrt device with a readable
 thermal zone should work.
+
+## Known limitations
+
+**ModemManager does not know `at_lock`.** It keeps the modem's AT ports open
+and sends its own commands without taking the lock this daemon uses. The daemon
+cannot detect that. Where ModemManager manages the modem, read the temperature
+another way (`modem_source` `file` or `command`) or set it to `none`; the
+section on sharing the modem says what `none` costs.
+
+**Without `curl`, notifications are limited.** `uclient-fetch` and `wget` cannot
+send `notify_header`. The message goes out without it, a webhook that needs it
+refuses the message, and it stays in the outbox, retried every two minutes.
+Both tools also take the address on their command line, where `/proc` shows it
+to every local process while the message goes out. An address with a query
+string or user info is refused for that reason and logged once; a secret in the
+path of the address cannot be told apart and is sent as it is.
+
+**A board that reports no temperature gets no processor protection.** When
+neither a thermal zone nor a hwmon sensor can be read, the daemon logs `this
+device reports no temperature at all, nothing to watch here` once and the
+status page says so. No stage can start from the processor side. The modem
+thresholds still apply as long as the modem gives a reading.
+
+**`wifi_off` sees only what netifd manages.** The action runs `wifi down` and
+confirms it through `ubus call network.wireless status`. Radios that netifd
+does not manage are neither switched by `wifi` nor seen by the check. When
+netifd lists no radio, the action fails and is notified, and the daemon warns
+once when it loads a configuration that uses `wifi_off`. When netifd does not
+answer, the action fails as well.
+
+**Two cooling devices of the same type cannot be told apart.** The daemon
+takes the first one of `fan_cooling_device_type` whose `max_state` is above 0.
+If your board has such a setup, please report it.
 
 ## License
 
