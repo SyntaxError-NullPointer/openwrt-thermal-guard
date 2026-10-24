@@ -8,6 +8,13 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# Under busybox sh, "sh" is busybox sh for the daemon too: on a host where sh
+# is bash, the selftest would otherwise never run under ash.
+self=$(readlink "/proc/$$/exe")
+if [ "${self##*/}" = busybox ]; then
+	mkdir -p "$tmp/ash"; ln -s "$self" "$tmp/ash/sh"
+	PATH="$tmp/ash:$PATH"; export PATH
+fi
 
 STATE_DIR="$tmp/state" \
 STATUS_FILE="$tmp/status" \
