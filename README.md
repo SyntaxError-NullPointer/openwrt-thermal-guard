@@ -332,7 +332,9 @@ three times per start until it gets an answer, and looks the model up in
 `/usr/share/thermal-guard/modems`. The first matching line gives `modem_warn`
 and `modem_crit`. Values set in `/etc/config/thermal-guard` win, option by
 option, so a tuned installation keeps its numbers. The status page shows the
-model, the profile and where each limit came from.
+model in one row and the profile with its own thresholds in the next
+(`85 / 95 °C (RM520N-GL*)`); without a profile it shows the thresholds in force,
+called defaults only while neither of them is set in the configuration.
 
 The table ships with the package and is replaced on every update. Every line
 names its source, a measurement or a published limit. A modem that is not in
@@ -746,6 +748,13 @@ the page waits for its own clear, or the status file says
 `reset_state=running` from a reset started at most 500 seconds ago, a status
 file that stopped being written reads "Clearing is running, readings resume
 afterwards." instead of "The service is not running".
+
+The page measures every age against the router's clock, read through
+`luci.getUnixtime` (the ACL grants that call for reading), never against the
+browser's: the age of the last reading, whether the status file is still being
+written, and how old a running clear is. A router without NTP is often hours or
+days apart from the browser and would otherwise look stopped. Where the call
+fails, the browser's clock stands in.
 
 `/var/run/thermal-guard.status` holds a machine readable snapshot. Everything
 else reads that file, so only the daemon talks to the modem, and `thermal-guard

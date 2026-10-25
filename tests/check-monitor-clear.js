@@ -30,6 +30,9 @@ Date.now = function() { return clock; };
 var notes = [];
 var execResult = null;
 var rendered = null;
+// What luci.getUnixtime answers, the router's clock; null makes the call fail.
+var unixtime = null;
+var statusText = null;
 
 function E(tag, attrs, children) {
 	return { tag: tag, attrs: attrs, children: children };
@@ -40,8 +43,19 @@ var stubs = {
 	poll: { add: function() {} },
 	dom: { content: function(node, children) { rendered = children; } },
 	fs: {
-		read: function() { return Promise.reject(new Error('not in this check')); },
+		read: function() {
+			return statusText === null ? Promise.reject(new Error('not in this check'))
+				: Promise.resolve(statusText);
+		},
 		exec: function() { return Promise.resolve(execResult); }
+	},
+	rpc: {
+		declare: function() {
+			return function() {
+				return unixtime === null ? Promise.reject(new Error('no getUnixtime'))
+					: Promise.resolve(unixtime);
+			};
+		}
 	},
 	ui: {
 		addNotification: function(title, node, type) {
@@ -56,8 +70,8 @@ var stubs = {
 
 // The view file is a LuCI module body: its top level return is only valid
 // inside a function, which is how LuCI loads it too.
-var proto = new Function('view', 'poll', 'dom', 'fs', 'ui', '_', 'E', 'L', src)(
-	stubs.view, stubs.poll, stubs.dom, stubs.fs, stubs.ui, stubs._, stubs.E, stubs.L);
+var proto = new Function('view', 'poll', 'dom', 'fs', 'ui', 'rpc', '_', 'E', 'L', src)(
+	stubs.view, stubs.poll, stubs.dom, stubs.fs, stubs.ui, stubs.rpc, stubs._, stubs.E, stubs.L);
 
 var A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 var B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -388,6 +402,145 @@ function runBanner(b) {
 		throw new Error('banner ' + JSON.stringify(got) + ', expected ' + JSON.stringify(b.banner));
 }
 
+// Every string in a rendered tree, in order.
+function texts(n, out) {
+	out = out || [];
+	if (typeof n === 'string')
+		out.push(n);
+	else if (Array.isArray(n))
+		n.forEach(function(c) { texts(c, out); });
+	else if (n && typeof n === 'object')
+		texts(n.children, out);
+	return out;
+}
+
+// The value next to a label in a tg-row, null without such a row.
+function rowValue(n, label) {
+	var i, v;
+	if (Array.isArray(n)) {
+		for (i = 0; i < n.length; i++)
+			if ((v = rowValue(n[i], label)) !== null)
+				return v;
+		return null;
+	}
+	if (!n || typeof n !== 'object')
+		return null;
+	if (n.attrs && n.attrs['class'] === 'tg-row' && n.children[0].children === label)
+		return texts(n.children[2]).join('');
+	return rowValue(n.children, label);
+}
+
+// The router at R; the browser clock is set apart from it on purpose.
+var R = 1792759304;
+var AHEAD = 167348;
+function page(lines) {
+	return [ 'version=2.1.2.0', 'enabled=1', 'interval=20', 'stage=-1', 'cpu_c=50' ]
+		.concat(lines).join('\n') + '\n';
+}
+
+// status: the file, router: what getUnixtime says (null: the call fails),
+// browser: Date.now in seconds. has and lacks: strings, rows: label to value.
+var pages = [
+	{
+		name: 'a router clock 46 h behind the browser does not make the service look stopped',
+		status: page([ 'now=' + (R - 3), 'ts=' + (R - 4) ]),
+		router: R, browser: R + AHEAD,
+		has: [ 'Last reading: 4 s ago' ],
+		lacks: [ 'The service is not running. Temperatures are not being watched.' ]
+	},
+	{
+		name: 'a file not written for three intervals by the router clock is a stopped service',
+		status: page([ 'now=' + (R - 200), 'ts=' + (R - 200) ]),
+		router: R, browser: R - 10 * 86400,
+		has: [ 'The service is not running. Temperatures are not being watched.',
+			'Last reading: 3 min ago' ]
+	},
+	{
+		name: 'a clear that runs is told by the router clock',
+		status: page([ 'now=' + (R - 200), 'ts=' + (R - 200), 'reset_state=running',
+			'reset_ts=' + (R - 100) ]),
+		router: R, browser: R + AHEAD,
+		has: [ 'Clearing is running, readings resume afterwards.' ],
+		lacks: [ 'The service is not running. Temperatures are not being watched.' ]
+	},
+	{
+		name: 'without the router clock the browser clock stands in',
+		status: page([ 'now=' + (R - 3), 'ts=' + (R - 3) ]),
+		router: null, browser: R,
+		has: [ 'Last reading: 3 s ago' ],
+		lacks: [ 'The service is not running. Temperatures are not being watched.' ]
+	},
+	{
+		name: 'the modem model and its profile are two rows',
+		status: page([ 'now=' + R, 'ts=' + R, 'modem_src=at', 'modem_c=55',
+			'modem_model=RM520N-GL', 'modem_profile=RM520N-GL*', 'modem_profile_warn=85',
+			'modem_profile_crit=95', 'modem_warn=85', 'modem_crit=95', 'modem_warn_src=uci',
+			'modem_crit_src=uci' ]),
+		router: R, browser: R,
+		rows: { 'Modem model': 'RM520N-GL', 'Modem profile': '85 / 95 °C (RM520N-GL*)' }
+	},
+	{
+		name: 'without a profile the default thresholds are named as such',
+		status: page([ 'now=' + R, 'ts=' + R, 'modem_src=at', 'modem_c=55', 'modem_model=EM7455',
+			'modem_profile=', 'modem_warn=80', 'modem_crit=88', 'modem_warn_src=default',
+			'modem_crit_src=default' ]),
+		router: R, browser: R,
+		rows: { 'Modem model': 'EM7455', 'Modem profile': 'none, defaults 80 / 88 °C' }
+	},
+	{
+		name: 'without a profile configured thresholds are not called defaults',
+		status: page([ 'now=' + R, 'ts=' + R, 'modem_src=at', 'modem_c=55', 'modem_model=EM7455',
+			'modem_profile=', 'modem_warn=85', 'modem_crit=95', 'modem_warn_src=uci',
+			'modem_crit_src=uci' ]),
+		router: R, browser: R,
+		rows: { 'Modem model': 'EM7455', 'Modem profile': 'none, configured 85 / 95 °C' }
+	},
+	{
+		name: 'a configured critical threshold alone is not called a default',
+		status: page([ 'now=' + R, 'ts=' + R, 'modem_src=at', 'modem_c=55', 'modem_model=EM7455',
+			'modem_profile=', 'modem_warn=80', 'modem_crit=95', 'modem_warn_src=default',
+			'modem_crit_src=uci' ]),
+		router: R, browser: R,
+		rows: { 'Modem model': 'EM7455', 'Modem profile': 'none, configured 80 / 95 °C' }
+	},
+	{
+		name: 'nor is a configured warning threshold alone',
+		status: page([ 'now=' + R, 'ts=' + R, 'modem_src=at', 'modem_c=55', 'modem_model=EM7455',
+			'modem_profile=', 'modem_warn=82', 'modem_crit=88', 'modem_warn_src=uci',
+			'modem_crit_src=default' ]),
+		router: R, browser: R,
+		rows: { 'Modem model': 'EM7455', 'Modem profile': 'none, configured 82 / 88 °C' }
+	}
+];
+
+// Through load() and render(), the way LuCI shows the page.
+function runPage(p) {
+	var v = Object.create(proto);
+	rendered = null;
+	statusText = p.status;
+	unixtime = p.router;
+	clock = p.browser * 1000;
+	return Promise.resolve(v.load()).then(function(data) {
+		v.render(data);
+		var all = texts(rendered).join('\n');
+		(p.has || []).forEach(function(s) {
+			if (all.indexOf(s) < 0)
+				throw new Error('missing ' + JSON.stringify(s) + ' in ' + JSON.stringify(all));
+		});
+		(p.lacks || []).forEach(function(s) {
+			if (all.indexOf(s) >= 0)
+				throw new Error('unexpected ' + JSON.stringify(s));
+		});
+		Object.keys(p.rows || {}).forEach(function(label) {
+			var got = rowValue(rendered, label);
+			if (got !== p.rows[label])
+				throw new Error(label + ' ' + JSON.stringify(got) + ', expected ' +
+					JSON.stringify(p.rows[label]));
+		});
+	}).then(function() { statusText = null; unixtime = null; },
+		function(err) { statusText = null; unixtime = null; throw err; });
+}
+
 function same(a, b) {
 	return JSON.stringify(a) === JSON.stringify(b);
 }
@@ -423,7 +576,6 @@ cases.reduce(function(p, c) {
 		});
 	});
 }, Promise.resolve()).then(function() {
-	var total = cases.length + banners.length;
 	banners.forEach(function(b) {
 		try {
 			runBanner(b);
@@ -432,6 +584,16 @@ cases.reduce(function(p, c) {
 			console.log('FAIL ' + b.name + ': ' + (err && err.message || err));
 		}
 	});
+	return pages.reduce(function(p, c) {
+		return p.then(function() {
+			return runPage(c).catch(function(err) {
+				failed++;
+				console.log('FAIL ' + c.name + ': ' + (err && err.message || err));
+			});
+		});
+	}, Promise.resolve());
+}).then(function() {
+	var total = cases.length + banners.length + pages.length;
 	if (failed) {
 		console.log('check-monitor-clear: ' + failed + ' of ' + total + ' cases failed');
 		process.exit(1);

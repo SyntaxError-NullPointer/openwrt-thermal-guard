@@ -5,6 +5,41 @@ Versions follow `Major.Minor.Patch` up to 2.0.0 and
 `Major.Minor.Build.Revision` from 2.1.0.0; both packages are released
 together and carry the same number.
 
+## 2.1.2.0
+
+A fix release for the status page of `luci-app-thermal-guard`. The daemon is
+unchanged apart from its version number.
+
+### Notes for operators
+
+- **Security relevant: the rpcd ACL of `luci-app-thermal-guard` grants one more
+  call for reading, `luci.getUnixtime`** (the router's clock). LuCI's own
+  status pages use the same call.
+- After the upgrade, reload the status page with the browser cache emptied (or
+  open it in a private window). LuCI loads the page script separately, and a
+  browser that had the page open before may keep showing the old one, with the
+  modem in one row, even after a forced reload.
+
+### Fixed
+
+- **A router without NTP no longer looks stopped.** The status page measured
+  the age of the last reading, whether the status file was still written and
+  how long a clear had been running against the browser's clock, while every
+  time in the status file comes from the router's. On a router hours or days
+  behind, the page said "The service is not running" and "Last reading: 2789
+  min ago" while the daemon ran. It now reads the router's clock through
+  `luci.getUnixtime` with every poll; where that fails, the browser's clock
+  stands in as before.
+
+### Changed
+
+- The modem shows in two rows: "Modem model" with the model alone, and "Modem
+  profile" with the profile's thresholds and its pattern, `85 / 95 °C
+  (RM520N-GL*)`. Without a profile the row gives the thresholds in force:
+  `none, defaults 80 / 88 °C` while neither is set in the configuration,
+  otherwise `none, configured 80 / 95 °C`, also when only one is. The single row
+  repeated the model in the profile pattern (`FM350-GL, profile FM350-GL*`).
+
 ## 2.1.1.0
 
 A hardening release on top of 2.1.0.0, which was never published. It fixes
